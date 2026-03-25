@@ -9,9 +9,7 @@
   See terminal output, approve permissions, and send voice commands — all from your wrist.
 </p>
 
-<p align="center">
-  <img src="recording.gif" width="350" alt="Claude Watch Demo" />
-</p>
+https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
 
 ---
 
