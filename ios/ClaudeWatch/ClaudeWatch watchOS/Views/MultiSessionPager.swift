@@ -8,8 +8,8 @@ struct MultiSessionPager: View {
             waitingView
         } else {
             TabView(selection: $state.activeSessionIndex) {
-                ForEach(Array(state.sessions.enumerated()), id: \.element.id) { index, session in
-                    SessionView(agentSession: session)
+                ForEach(Array(state.sessions.enumerated()), id: \.element.id) { index, _ in
+                    SessionView(sessionIndex: index)
                         .tag(index)
                 }
             }

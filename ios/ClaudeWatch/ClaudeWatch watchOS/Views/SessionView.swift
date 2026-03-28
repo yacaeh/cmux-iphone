@@ -1,12 +1,19 @@
 import SwiftUI
 
 struct SessionView: View {
-    let agentSession: AgentSession
+    let sessionIndex: Int
     @EnvironmentObject private var session: WatchViewState
 
     @State private var showVoiceInput = false
     @State private var cursorVisible = true
     private let cursorTimer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+
+    private var agentSession: AgentSession {
+        guard session.sessions.indices.contains(sessionIndex) else {
+            return AgentSession(id: "", agent: .claude, cwd: "", folderName: "", activity: .idle)
+        }
+        return session.sessions[sessionIndex]
+    }
 
     var body: some View {
         ZStack {
@@ -186,7 +193,7 @@ struct SessionView: View {
         return s
     }()
 
-    SessionView(agentSession: session)
+    SessionView(sessionIndex: 0)
         .environmentObject(WatchViewState.shared)
 }
 
