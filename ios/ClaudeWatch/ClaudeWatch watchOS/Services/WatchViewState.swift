@@ -405,8 +405,8 @@ class WatchViewState: ObservableObject {
         guard let permissionId = approval?.permissionId ?? UserDefaults.standard.string(forKey: "watch_pending_permission"),
               let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
+        let sessionId = activeSession?.id
         pendingApproval = nil
-        // Clear from session
         if let session = activeSession, let idx = sessionIndex(for: session.id) {
             sessions[idx].pendingApproval = nil
             sessions[idx].activity = .running
@@ -426,8 +426,23 @@ class WatchViewState: ObservableObject {
         ]
         urlRequest.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: urlRequest).resume()
-        appendLine(TerminalLine(text: "→ \(optionLabel)", type: .command), sessionId: activeSession?.id)
+        URLSession.shared.dataTask(with: urlRequest) { [weak self] _, response, error in
+            if let error {
+                print("[WatchViewState] Permission response failed: \(error)")
+                return
+            }
+            guard let http = response as? HTTPURLResponse else { return }
+            if http.statusCode == 401 {
+                print("[WatchViewState] Permission response 401 — bridge token changed, re-pairing")
+                DispatchQueue.main.async { self?.handleTokenRejected() }
+            } else if http.statusCode == 404 {
+                print("[WatchViewState] Permission response 404 — permissionId not found (bridge restarted?)")
+            } else if http.statusCode != 200 {
+                print("[WatchViewState] Permission response unexpected status: \(http.statusCode)")
+            }
+        }.resume()
+
+        appendLine(TerminalLine(text: "→ \(optionLabel)", type: .command), sessionId: sessionId)
         UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
     }
 
@@ -436,6 +451,7 @@ class WatchViewState: ObservableObject {
         guard let permissionId = approval?.permissionId ?? UserDefaults.standard.string(forKey: "watch_pending_permission"),
               let baseURL = bridge.baseURL, let token = bridge.token else { return }
 
+        let sessionId = activeSession?.id
         pendingApproval = nil
         if let session = activeSession, let idx = sessionIndex(for: session.id) {
             sessions[idx].pendingApproval = nil
@@ -454,13 +470,25 @@ class WatchViewState: ObservableObject {
         ]
         urlRequest.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: urlRequest) { _, _, error in
-            if let error { print("[WatchViewState] Permission response failed: \(error)") }
+        URLSession.shared.dataTask(with: urlRequest) { [weak self] _, response, error in
+            if let error {
+                print("[WatchViewState] Permission response failed: \(error)")
+                return
+            }
+            guard let http = response as? HTTPURLResponse else { return }
+            if http.statusCode == 401 {
+                print("[WatchViewState] Permission response 401 — bridge token changed, re-pairing")
+                DispatchQueue.main.async { self?.handleTokenRejected() }
+            } else if http.statusCode == 404 {
+                print("[WatchViewState] Permission response 404 — permissionId not found (bridge restarted?)")
+            } else if http.statusCode != 200 {
+                print("[WatchViewState] Permission response unexpected status: \(http.statusCode)")
+            }
         }.resume()
 
         appendLine(
             TerminalLine(text: approved ? "✓ Approved" : "✗ Denied", type: approved ? .output : .error),
-            sessionId: activeSession?.id
+            sessionId: sessionId
         )
         UserDefaults.standard.removeObject(forKey: "watch_pending_permission")
     }

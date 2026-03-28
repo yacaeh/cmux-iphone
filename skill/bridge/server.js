@@ -1042,6 +1042,10 @@ async function handleCommand(req, res) {
       }
       pendingPermissionBodies.delete(permissionId);
 
+      // Forward the watch's selected option so the hook response can include it
+      if (selectedOption !== undefined) decision.selectedOption = selectedOption;
+      if (Number.isInteger(optionIndex)) decision.optionIndex = optionIndex;
+
       const resolved = resolvePermission(permissionId, decision);
       if (resolved) {
         log("info", `Permission ${permissionId} resolved: ${decision.behavior}${allowAll ? " (allow all)" : ""}`);
@@ -1290,6 +1294,10 @@ async function handleHookPermission(req, res) {
     return jsonResponse(res, 400, { error: "Invalid JSON" });
   }
 
+  // Disable Node.js default 5-minute requestTimeout for this long-lived blocking request.
+  // The hook waits up to PERMISSION_TIMEOUT_MS (10 min) for a watch response.
+  req.socket.setTimeout(0);
+
   const sid = resolveHookSession(body);
   const permissionId = crypto.randomUUID();
   log("info", `Hook: PermissionRequest received (id: ${permissionId})${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
@@ -1317,6 +1325,17 @@ async function handleHookPermission(req, res) {
 
   if (decision.behavior === "deny" && decision.message) {
     hookResponse.hookSpecificOutput.decision.message = decision.message;
+  }
+
+  // For AskUserQuestion: forward the watch-selected option as the answer so Claude
+  // Code doesn't fall back to waiting for terminal input.
+  if (decision.selectedOption !== undefined && body.tool_name === "AskUserQuestion") {
+    const questions = body.tool_input?.questions;
+    if (questions && questions.length > 0 && questions[0]?.question) {
+      const answers = { [questions[0].question]: decision.selectedOption };
+      hookResponse.hookSpecificOutput.decision.updatedInput = { questions, answers };
+      log("info", `AskUserQuestion answer forwarded: "${decision.selectedOption}"`);
+    }
   }
 
   return jsonResponse(res, 200, hookResponse);
