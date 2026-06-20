@@ -70,7 +70,7 @@ const norm = (p) => (typeof p === "string" ? p.replace(/\/+$/, "") : p);
 // Resolve a session's cwd + agent to a cmux surface ref (e.g. "surface:16").
 // Returns null if cmux is unavailable or no matching live surface is found.
 export function resolveSurface(cwd, agent = "claude") {
-  if (!CMUX_BIN || !cwd) return null;
+  if (!CMUX_BIN) return null;
   let tsv;
   try {
     tsv = cmux(["top", "--all", "--processes", "--format", "tsv"]);
@@ -80,6 +80,9 @@ export function resolveSurface(cwd, agent = "claude") {
   const needle = agent === "codex" ? "codex" : "claude";
   const target = norm(cwd);
 
+  // Collect one entry per live surface running this agent, with its cwd.
+  const candidates = [];
+  const seen = new Set();
   for (const row of tsv.split("\n")) {
     // TSV columns: cpu  mem  count  type  id  parent  name
     const cols = row.split("\t");
@@ -88,9 +91,30 @@ export function resolveSurface(cwd, agent = "claude") {
     const parent = cols[5] || "";
     if (!name.includes(needle)) continue;
     if (!parent.startsWith("surface:")) continue;
-    const pid = cols[4];
-    if (norm(processCwd(pid)) === target) return parent;
+    if (seen.has(parent)) continue; // one entry per surface
+    seen.add(parent);
+    candidates.push({ surface: parent, cwd: norm(processCwd(cols[4])) });
   }
+
+  if (candidates.length === 0) return null;
+
+  // 1) Exact cwd match — most precise.
+  if (target) {
+    const exact = candidates.find((c) => c.cwd === target);
+    if (exact) return exact.surface;
+
+    // 2) Path-relationship match — the session's cwd is a sub/parent directory
+    //    of a pane's cwd (hooks sometimes report a subdir of the launch dir).
+    const rel = candidates.find(
+      (c) => c.cwd && (target.startsWith(c.cwd + "/") || c.cwd.startsWith(target + "/"))
+    );
+    if (rel) return rel.surface;
+  }
+
+  // 3) Exactly one live pane for this agent — unambiguous, use it even if the
+  //    cwd didn't line up (common: a single Claude/Codex pane on screen).
+  if (candidates.length === 1) return candidates[0].surface;
+
   return null;
 }
 
