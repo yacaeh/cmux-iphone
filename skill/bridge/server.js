@@ -1577,7 +1577,9 @@ function handleCmuxTree(req, res) {
   if (!cmux.cmuxAvailable()) return jsonResponse(res, 200, { available: false, workspaces: [] });
 
   const data = cmux.mobileWorkspaces();
-  const workspaces = (data?.workspaces || []).map((w) => ({
+  const workspaces = (data?.workspaces || [])
+    .filter((w) => w.title !== "Agent Bridge") // hide the bridge's own workspace
+    .map((w) => ({
     id: w.id,
     title: w.title,
     cwd: w.current_directory,
