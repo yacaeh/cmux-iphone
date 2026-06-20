@@ -94,10 +94,10 @@ new_hooks = {
             'timeout': 5
         }]
     }],
-    'PreToolUse': [{
+    'SessionEnd': [{
         'hooks': [{
             'type': 'http',
-            'url': f'{BRIDGE}/hooks/tool-output',
+            'url': f'{BRIDGE}/hooks/session-end',
             'timeout': 5
         }]
     }],
@@ -126,14 +126,6 @@ new_hooks = {
         'hooks': [{
             'type': 'http',
             'url': f'{BRIDGE}/hooks/error',
-            'timeout': 5
-        }]
-    }],
-    'Notification': [{
-        'matcher': 'idle_prompt|permission_prompt',
-        'hooks': [{
-            'type': 'http',
-            'url': f'{BRIDGE}/hooks/stop',
             'timeout': 5
         }]
     }]

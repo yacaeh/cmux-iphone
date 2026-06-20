@@ -211,10 +211,21 @@ function jsonResponse(res, status, body) {
   res.end(payload);
 }
 
+const MAX_BODY_BYTES = 4 * 1024 * 1024; // 4 MB cap — transcripts can be large
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => {
       try {
         const raw = Buffer.concat(chunks).toString("utf-8");
@@ -1283,6 +1294,7 @@ function handleEvents(req, res) {
   }
 
   sseClients.add(res);
+  bridgeState = "connected";
   log("info", `SSE client connected (total: ${sseClients.size})`);
 
   // Send current sessions state so late-connecting clients see existing sessions
@@ -1328,6 +1340,7 @@ function handleEvents(req, res) {
   req.on("close", () => {
     clearInterval(heartbeat);
     sseClients.delete(res);
+    if (sseClients.size === 0) bridgeState = "idle";
     log("info", `SSE client disconnected (total: ${sseClients.size})`);
   });
 }
@@ -1336,38 +1349,52 @@ function handleEvents(req, res) {
 // Hooks come from Claude Code instances. We match by cwd to find the session.
 
 function resolveHookSession(body) {
-  const cwd = body.session_cwd || body.cwd || null;
   const source = body.source || "claude";
-
-  // Try exact cwd match first
-  const match = findSessionByCwd(cwd);
-  if (match) return match.id;
-
-  // Fallback: if exactly one running session, use it
-  const active = findMostRecentActiveSession();
-  if (active) return active.id;
-
-  // No session exists — auto-create one for this external Claude/Codex instance
   const agent = source === "codex" ? "codex" : "claude";
-  const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
-  const folderName = path.basename(resolvedCwd) || resolvedCwd;
-  const sessionId = crypto.randomUUID();
+  const claudeSid = body.session_id || null; // the agent's own session id
+  const cwd = body.session_cwd || body.cwd || null;
 
-  const slot = {
-    id: sessionId,
-    agent,
-    cwd: resolvedCwd,
-    folderName,
-    ptyProcess: null, // External process — no PTY owned by bridge
-    state: "running",
-    createdAt: Date.now(),
+  const createSlot = (id) => {
+    const resolvedCwd = cwd || process.argv[2] || process.env.HOME || process.cwd();
+    const folderName = path.basename(resolvedCwd) || resolvedCwd;
+    const slot = {
+      id, agent, cwd: resolvedCwd, folderName,
+      ptyProcess: null, // external process — no PTY owned by bridge
+      state: "running", createdAt: Date.now(),
+    };
+    sessions.set(id, slot);
+    log("info", `Session ${id} (${agent}) registered from hook (${folderName})`);
+    pushSseEvent("session", { state: "running", agent, cwd: resolvedCwd, folderName }, id);
+    return id;
   };
-  sessions.set(sessionId, slot);
 
-  log("info", `Auto-created session ${sessionId} for external ${agent} (${folderName})`);
-  pushSseEvent("session", { state: "running", agent, cwd: resolvedCwd, folderName }, sessionId);
+  // 1) Primary: key by the agent's real session_id — stable and unambiguous, so
+  //    multiple sessions in the same cwd (Claude+Codex, multiple windows, repeat
+  //    sessions of one project) never get cross-wired.
+  if (claudeSid) {
+    const existing = sessions.get(claudeSid);
+    if (existing) {
+      if (existing.state === "ended") existing.state = "running";
+      return existing.id;
+    }
+    return createSlot(claudeSid);
+  }
 
-  return sessionId;
+  // 2) No session_id (e.g. Codex hooks): match by cwd AND agent so Codex events
+  //    never attach to a Claude slot in the same folder.
+  for (const [, s] of sessions) {
+    if (s.agent === agent && s.cwd === cwd && s.state !== "ended") return s.id;
+  }
+  // 3) Most-recent active session of the SAME agent.
+  let best = null;
+  for (const [, s] of sessions) {
+    if (s.agent !== agent || s.state === "ended") continue;
+    if (!best || (s.createdAt || 0) > (best.createdAt || 0)) best = s;
+  }
+  if (best) return best.id;
+
+  // 4) Nothing matched — create one.
+  return createSlot(crypto.randomUUID());
 }
 
 async function handleHookToolOutput(req, res) {
@@ -1538,6 +1565,29 @@ async function handleHookError(req, res) {
   return jsonResponse(res, 200, { ok: true });
 }
 
+// SessionEnd — mark the external session ended and drop it after a grace period
+// so the list doesn't accumulate dead "running" sessions forever.
+async function handleHookSessionEnd(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    return jsonResponse(res, 400, { error: "Invalid JSON" });
+  }
+  const sid = body.session_id;
+  const slot = sid ? sessions.get(sid) : null;
+  if (slot) {
+    slot.state = "ended";
+    log("info", `Hook: SessionEnd ${sid}`);
+    pushSseEvent("session", { state: "ended", agent: slot.agent, folderName: slot.folderName }, sid);
+    setTimeout(() => {
+      if (sessions.get(sid)?.state === "ended") sessions.delete(sid);
+    }, 30000);
+  }
+  return jsonResponse(res, 200, { ok: true });
+}
+
 function handleStatus(_req, res) {
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
@@ -1577,7 +1627,12 @@ function handleCmuxTree(req, res) {
   if (!cmux.cmuxAvailable()) return jsonResponse(res, 200, { available: false, workspaces: [] });
 
   const data = cmux.mobileWorkspaces();
-  const workspaces = (data?.workspaces || [])
+  // RPC failed (socket/cmux down) — report unavailable so the app falls back to
+  // the hook-based view instead of showing an empty cmux screen.
+  if (!data || !Array.isArray(data.workspaces)) {
+    return jsonResponse(res, 200, { available: false, workspaces: [] });
+  }
+  const workspaces = (data.workspaces || [])
     .filter((w) => w.title !== "Agent Bridge") // hide the bridge's own workspace
     .map((w) => ({
     id: w.id,
@@ -1657,14 +1712,27 @@ const routes = {
   "POST /hooks/stop": handleHookStop,
   "POST /hooks/task-complete": handleHookTaskComplete,
   "POST /hooks/error": handleHookError,
+  "POST /hooks/session-end": handleHookSessionEnd,
   "GET /status": handleStatus,
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,
 };
 
+function isLocalRequest(req) {
+  const addr = req.socket?.remoteAddress || "";
+  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
 async function onRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const routeKey = `${req.method} ${url.pathname}`;
+
+  // /hooks/* are only ever called by the local Claude Code/Codex on this Mac.
+  // The server binds 0.0.0.0 for the phone, so reject remote callers here —
+  // otherwise anyone on the network could forge sessions / spam approvals.
+  if (url.pathname.startsWith("/hooks/") && !isLocalRequest(req)) {
+    return jsonResponse(res, 403, { error: "Forbidden" });
+  }
 
   const handler = routes[routeKey];
   if (handler) {
@@ -1699,7 +1767,13 @@ async function startServer() {
   const server = http.createServer(onRequest);
 
   let boundPort = null;
-  for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
+  // Honor an explicit PORT (env / installer arg); otherwise scan the range.
+  const envPort = parseInt(process.env.PORT, 10);
+  const candidatePorts = Number.isInteger(envPort) ? [envPort] : [];
+  for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
+    if (p !== envPort) candidatePorts.push(p);
+  }
+  for (const port of candidatePorts) {
     try {
       boundPort = await tryListen(server, port);
       break;
