@@ -171,11 +171,44 @@ export function mobileWorkspaces() {
 }
 
 // Plain-text rendering of a terminal/surface (accepts a UUID or surface ref).
+// Reconstruct plain text lines from cmux render-grid spans
+// ({row, column, text}). Pads gaps with spaces, preserves row order.
+function spansToLines(spans) {
+  const byRow = new Map();
+  let maxRow = -1;
+  for (const s of spans || []) {
+    if (typeof s.row !== "number") continue;
+    if (!byRow.has(s.row)) byRow.set(s.row, []);
+    byRow.get(s.row).push(s);
+    if (s.row > maxRow) maxRow = s.row;
+  }
+  const lines = [];
+  for (let r = 0; r <= maxRow; r++) {
+    const rs = byRow.get(r);
+    if (!rs) { lines.push(""); continue; }
+    rs.sort((a, b) => (a.column || 0) - (b.column || 0));
+    let line = "";
+    for (const s of rs) {
+      const col = s.column || 0;
+      if (col > line.length) line += " ".repeat(col - line.length);
+      line += s.text || "";
+    }
+    lines.push(line.replace(/\s+$/, ""));
+  }
+  return lines;
+}
+
+// Plain-text screen of one terminal via mobile.terminal.replay, which (unlike
+// surface.read_text) honors the terminal_id. Combines scrollback + visible.
 export function readTerminalText(id) {
   if (!CMUX_BIN || !id) return null;
   try {
-    const r = rpc("surface.read_text", { surface: id });
-    return r && typeof r.text === "string" ? r.text : null;
+    const r = rpc("mobile.terminal.replay", { terminal_id: id });
+    const rg = r && r.render_grid;
+    if (!rg) return null;
+    const lines = spansToLines(rg.scrollback_spans).concat(spansToLines(rg.row_spans));
+    const text = lines.join("\n").replace(/^\n+/, "").replace(/\n{3,}/g, "\n\n");
+    return text.split("\n").slice(-400).join("\n");
   } catch {
     return null;
   }
