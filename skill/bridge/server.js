@@ -1113,6 +1113,22 @@ async function handleCommand(req, res) {
     optionIndex,
   } = body;
 
+  // --- Direct cmux key event (mobile mirror, drives interactive TUI pickers) ---
+  // e.g. codex's "/model" popup: arrows to move, enter to accept, escape to
+  // back out. Sent as raw ANSI via mobile.terminal.input (see cmux.sendNamedKey).
+  if (body.key !== undefined && body.terminalId) {
+    if (!cmux.cmuxAvailable()) return jsonResponse(res, 503, { error: "cmux not available" });
+    const key = String(body.key);
+    if (!cmux.isNamedKey(key)) return jsonResponse(res, 400, { error: `unsupported key: ${key}` });
+    try {
+      await cmux.sendNamedKey(body.terminalId, key);
+      log("info", `cmux mobile key -> terminal ${String(body.terminalId).slice(0, 8)}: ${key}`);
+      return jsonResponse(res, 200, { ok: true, terminalId: body.terminalId, key, via: "cmux-mobile" });
+    } catch (err) {
+      return jsonResponse(res, 500, { error: `cmux key failed: ${err.message}` });
+    }
+  }
+
   // --- Direct cmux terminal input (mobile mirror) ---
   if (command !== undefined && body.terminalId) {
     if (!cmux.cmuxAvailable()) return jsonResponse(res, 503, { error: "cmux not available" });

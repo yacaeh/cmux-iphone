@@ -270,6 +270,19 @@ final class RelayService: ObservableObject {
         Task { try? await bridgeClient.sendCommand(text: text, terminalId: terminalId) }
     }
 
+    /// Awaitable cmux text send with explicit submit control — used by the codex
+    /// model/effort driver, which types a slash command (submit) then picks rows
+    /// with single digits (no submit). Unguarded by design (it drives the screen).
+    func sendCmuxText(terminalId: String, text: String, submit: Bool) async {
+        try? await bridgeClient.sendCommand(text: text, terminalId: terminalId, submit: submit)
+    }
+
+    /// Send a named special key (up/down/enter/escape/…) to a cmux terminal —
+    /// drives interactive TUI pickers like codex's `/model` popup.
+    func sendCmuxKey(terminalId: String, key: String) async {
+        try? await bridgeClient.sendKey(terminalId: terminalId, key: key)
+    }
+
     /// Send an approval response guarded by the screen hash the user was viewing.
     /// Returns .screenChanged if the bridge rejected because the screen moved.
     func sendCmuxGuarded(terminalId: String, text: String, expectedScreenHash: String?, submit: Bool = true) async -> CmuxSendResult {

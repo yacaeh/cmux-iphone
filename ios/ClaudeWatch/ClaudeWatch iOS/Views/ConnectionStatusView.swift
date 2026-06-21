@@ -652,6 +652,8 @@ private struct CmuxTerminalView: View {
     @State private var screen: String = ""
     @State private var promptText: String = ""
     @State private var showModelSheet = false
+    @State private var codexDriving = false
+    @State private var codexStatus = ""
     @FocusState private var inputFocused: Bool
     private let pollTimer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
@@ -670,16 +672,33 @@ private struct CmuxTerminalView: View {
             if showModelSheet {
                 Color.black.opacity(0.5)
                     .ignoresSafeArea()
-                    .onTapGesture { withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { showModelSheet = false } }
+                    .onTapGesture { if !codexDriving { closeModelSheet() } }
                     .transition(.opacity)
 
                 ModelEffortPanel(
-                    onSend: { cmd in
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { showModelSheet = false }
+                    initialAgent: detectAgent(from: screen),
+                    liveScreen: screen,
+                    driving: codexDriving,
+                    statusText: codexStatus,
+                    onClaudeCommand: { cmd in
+                        closeModelSheet()
                         relayService.sendCmux(terminalId: terminalId, text: cmd)
                         Task { try? await Task.sleep(nanoseconds: 600_000_000); await refresh() }
                     },
-                    onDismiss: { withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { showModelSheet = false } }
+                    onCodexSelect: { model, effort in driveCodex(model: model, effort: effort) },
+                    onKey: { key in
+                        Task {
+                            await relayService.sendCmuxKey(terminalId: terminalId, key: key)
+                            try? await Task.sleep(nanoseconds: 250_000_000); await refresh()
+                        }
+                    },
+                    onDigit: { digit in
+                        Task {
+                            await relayService.sendCmuxText(terminalId: terminalId, text: digit, submit: false)
+                            try? await Task.sleep(nanoseconds: 250_000_000); await refresh()
+                        }
+                    },
+                    onDismiss: { closeModelSheet() }
                 )
                 .transition(.scale(scale: 0.92).combined(with: .opacity))
             }
@@ -705,6 +724,96 @@ private struct CmuxTerminalView: View {
         if let s = await relayService.cmuxScreen(terminalId) {
             screen = s.text
         }
+    }
+
+    private func closeModelSheet() {
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { showModelSheet = false }
+    }
+
+    // Best-effort guess of the agent running in this terminal, from its live
+    // screen. Only a seed for the Claude/Codex toggle — the user can flip it.
+    // (Avoids "claude" matching the claude-watch cwd by requiring strong markers.)
+    private func detectAgent(from screen: String) -> String {
+        let s = screen.lowercased()
+        if s.contains("openai codex") || s.contains("codex cli") || s.contains("gpt-5") { return "codex" }
+        if s.contains("claude code") || s.contains("anthropic") { return "claude" }
+        return "claude"
+    }
+
+    // MARK: codex /model picker driver
+    //
+    // codex's "/model" is an interactive popup (no inline args), so we open it,
+    // read the rendered rows, and pick by the on-screen digit (position-proof).
+    // If a row can't be parsed we leave the popup open for the manual keypad —
+    // never blind-firing a guess into a live session.
+    private func driveCodex(model: String, effort: String?) {
+        guard !codexDriving else { return }
+        codexDriving = true
+        codexStatus = "모델 선택 중…"
+        Task {
+            defer { codexDriving = false }
+            let tid = terminalId
+
+            // 1) open the picker
+            await relayService.sendCmuxText(terminalId: tid, text: "/model", submit: true)
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            await refresh()
+            var scr = (await relayService.cmuxScreen(tid))?.text ?? ""
+
+            // 2) expand "All models" first if our concrete model isn't listed yet
+            if codexDigit(for: model, in: scr) == nil,
+               let allDigit = codexDigit(for: "all models", in: scr) {
+                await relayService.sendCmuxText(terminalId: tid, text: allDigit, submit: false)
+                try? await Task.sleep(nanoseconds: 550_000_000)
+                await refresh()
+                scr = (await relayService.cmuxScreen(tid))?.text ?? ""
+            }
+
+            // 3) pick the model row by its on-screen digit
+            guard let modelDigit = codexDigit(for: model, in: scr) else {
+                codexStatus = "자동 실패 — 아래 키패드로 직접 선택하세요"
+                return   // leave the popup open; manual keypad takes over
+            }
+            await relayService.sendCmuxText(terminalId: tid, text: modelDigit, submit: false)
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            await refresh()
+            scr = (await relayService.cmuxScreen(tid))?.text ?? ""
+
+            // 4) reasoning-effort stage — only if the popup actually advanced to it
+            if let effort, scr.lowercased().contains("reasoning"),
+               let effortDigit = codexDigit(for: effort, in: scr, wholeWord: true) {
+                await relayService.sendCmuxText(terminalId: tid, text: effortDigit, submit: false)
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                await refresh()
+            }
+
+            codexStatus = "완료"
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            closeModelSheet()
+            await refresh()
+        }
+    }
+
+    // Find the leading row-number for the picker row matching `label`. Scans only
+    // the text *before* the label so "gpt-5.5" never returns the "5" in its name;
+    // stops at a word boundary so it won't grab a digit from an earlier token.
+    // `wholeWord` rejects substring hits (so "high" won't match the "xhigh" row).
+    private func codexDigit(for label: String, in screen: String, wholeWord: Bool = false) -> String? {
+        let needle = label.lowercased()
+        for raw in screen.split(separator: "\n") {
+            let line = String(raw).lowercased()
+            guard let r = line.range(of: needle) else { continue }
+            if wholeWord {
+                let beforeOK = r.lowerBound == line.startIndex || !line[line.index(before: r.lowerBound)].isLetter
+                let afterOK = r.upperBound == line.endIndex || !line[r.upperBound].isLetter
+                if !(beforeOK && afterOK) { continue }
+            }
+            for ch in line[..<r.lowerBound].reversed() {
+                if let d = ch.wholeNumberValue, (1...9).contains(d) { return String(d) }
+                if ch.isLetter { break }
+            }
+        }
+        return nil
     }
 
     // MARK: terminal card (chrome + screen)
@@ -792,47 +901,67 @@ private struct CmuxTerminalView: View {
     }
 }
 
-/// Claude model + effort picker — centered overlay modal.
-/// Sends `/model <name>` / `/effort <level>` to the active cmux terminal.
+/// Model + effort picker — centered overlay modal, agent-aware.
+///
+/// Claude mode sends `/model <name>` / `/effort <level>` slash commands (Claude
+/// accepts inline args). Codex mode drives the interactive `/model` popup: tap a
+/// model to auto-select (parent reads the screen and picks by digit), or use the
+/// manual keypad while watching the live screen preview. A Claude/Codex segmented
+/// toggle (seeded by a screen heuristic) lets the user pick the right mode.
 private struct ModelEffortPanel: View {
-    let onSend: (String) -> Void
+    let liveScreen: String
+    let driving: Bool
+    let statusText: String
+    let onClaudeCommand: (String) -> Void
+    let onCodexSelect: (_ model: String, _ effort: String?) -> Void
+    let onKey: (String) -> Void
+    let onDigit: (String) -> Void
     let onDismiss: () -> Void
 
-    private let models: [(String, String)] = [
-        ("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku"),
+    @State private var agent: String
+    @State private var pendingEffort: String? = nil
+
+    init(initialAgent: String,
+         liveScreen: String,
+         driving: Bool,
+         statusText: String,
+         onClaudeCommand: @escaping (String) -> Void,
+         onCodexSelect: @escaping (String, String?) -> Void,
+         onKey: @escaping (String) -> Void,
+         onDigit: @escaping (String) -> Void,
+         onDismiss: @escaping () -> Void) {
+        self.liveScreen = liveScreen
+        self.driving = driving
+        self.statusText = statusText
+        self.onClaudeCommand = onClaudeCommand
+        self.onCodexSelect = onCodexSelect
+        self.onKey = onKey
+        self.onDigit = onDigit
+        self.onDismiss = onDismiss
+        _agent = State(initialValue: initialAgent)
+    }
+
+    private let claudeModels: [(String, String)] = [("Opus", "opus"), ("Sonnet", "sonnet"), ("Haiku", "haiku")]
+    private let claudeEfforts: [String] = ["low", "medium", "high", "xhigh", "max", "ultracode"]
+    private let codexModels: [String] = [
+        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex",
+        "gpt-5.1-codex-max", "gpt-5.1-codex", "auto-fast", "auto-balanced", "auto-thorough",
     ]
-    private let efforts: [String] = ["low", "medium", "high", "xhigh", "max", "ultracode"]
+    private let codexEfforts: [String] = ["none", "minimal", "low", "medium", "high", "xhigh"]
     private let cols = [GridItem(.adaptive(minimum: 88), spacing: 8)]
+    private let keypadCols = [GridItem(.adaptive(minimum: 40), spacing: 8)]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text("Claude 설정")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(Color.textPrimary)
-                Spacer()
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 22))
-                        .foregroundStyle(Color.subtleText)
-                }
-                .buttonStyle(.plain)
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            Picker("", selection: $agent) {
+                Text("Claude").tag("claude")
+                Text("Codex").tag("codex")
             }
+            .pickerStyle(.segmented)
+            .disabled(driving)
 
-            section("모델") {
-                ForEach(models, id: \.1) { (label, name) in
-                    chip(label, color: .claudeOrange) { onSend("/model \(name)") }
-                }
-            }
-            section("Effort") {
-                ForEach(efforts, id: \.self) { lvl in
-                    chip(lvl, color: .claudeAmber) { onSend("/effort \(lvl)") }
-                }
-            }
-
-            Text("선택하면 해당 터미널의 Claude에 슬래시 명령으로 전송됩니다.")
-                .font(.system(size: 11))
-                .foregroundStyle(Color.subtleText)
+            if agent == "claude" { claudeBody } else { codexBody }
         }
         .padding(20)
         .background(Color.cardBackground)
@@ -841,6 +970,127 @@ private struct ModelEffortPanel: View {
         .shadow(color: .black.opacity(0.35), radius: 24, y: 6)
         .padding(.horizontal, 24)
     }
+
+    private var header: some View {
+        HStack {
+            Text(agent == "codex" ? "Codex 설정" : "Claude 설정")
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(Color.textPrimary)
+            Spacer()
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundStyle(Color.subtleText)
+            }
+            .buttonStyle(.plain)
+            .disabled(driving)
+        }
+    }
+
+    // MARK: Claude
+
+    private var claudeBody: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            section("모델") {
+                ForEach(claudeModels, id: \.1) { (label, name) in
+                    chip(label, color: .claudeOrange) { onClaudeCommand("/model \(name)") }
+                }
+            }
+            section("Effort") {
+                ForEach(claudeEfforts, id: \.self) { lvl in
+                    chip(lvl, color: .claudeAmber) { onClaudeCommand("/effort \(lvl)") }
+                }
+            }
+            Text("선택하면 Claude에 슬래시 명령으로 전송됩니다.")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.subtleText)
+        }
+    }
+
+    // MARK: Codex
+
+    private var codexBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                section("모델 — 탭하면 자동 선택") {
+                    ForEach(codexModels, id: \.self) { m in
+                        chip(m, color: .claudeOrange, disabled: driving) { onCodexSelect(m, pendingEffort) }
+                    }
+                }
+                section("Reasoning · effort (모델과 함께 적용)") {
+                    ForEach(codexEfforts, id: \.self) { e in
+                        chip(e, color: .claudeAmber, selected: pendingEffort == e, disabled: driving) {
+                            pendingEffort = (pendingEffort == e) ? nil : e
+                        }
+                    }
+                }
+
+                if !statusText.isEmpty {
+                    HStack(spacing: 6) {
+                        if driving { ProgressView().scaleEffect(0.7) }
+                        Text(statusText)
+                            .font(.system(size: 11))
+                            .foregroundStyle(driving ? Color.subtleText : Color.claudeAmber)
+                    }
+                }
+
+                screenPreview
+                keypad
+
+                Text("자동이 안 되면 위 키패드로 팝업을 직접 조작하세요 (화면을 보며 ↑↓·숫자·⏎).")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.subtleText)
+            }
+            .padding(.vertical, 2)
+        }
+        .frame(maxHeight: 460)
+    }
+
+    private var screenPreview: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("화면 (실시간)")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.subtleText)
+            ScrollView {
+                Text(previewTail.isEmpty ? "…" : previewTail)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Color.textPrimary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(height: 116)
+            .padding(8)
+            .background(Color.appBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.hairline, lineWidth: 1))
+        }
+    }
+
+    private var keypad: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("수동 키패드")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.subtleText)
+            HStack(spacing: 8) {
+                keyButton("↑") { onKey("up") }
+                keyButton("↓") { onKey("down") }
+                keyButton("⏎") { onKey("enter") }
+                keyButton("esc") { onKey("escape") }
+            }
+            LazyVGrid(columns: keypadCols, spacing: 8) {
+                ForEach(1...9, id: \.self) { n in
+                    keyButton("\(n)") { onDigit("\(n)") }
+                }
+            }
+        }
+    }
+
+    private var previewTail: String {
+        let lines = liveScreen.split(separator: "\n", omittingEmptySubsequences: false)
+        return lines.suffix(40).joined(separator: "\n")
+    }
+
+    // MARK: shared chrome
 
     @ViewBuilder
     private func section<C: View>(_ title: String, @ViewBuilder content: () -> C) -> some View {
@@ -852,18 +1102,37 @@ private struct ModelEffortPanel: View {
         }
     }
 
-    private func chip(_ label: String, color: Color, action: @escaping () -> Void) -> some View {
+    private func chip(_ label: String, color: Color, selected: Bool = false, disabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(label)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
                 .foregroundStyle(Color.textPrimary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
-                .background(color.opacity(0.14))
+                .background(color.opacity(selected ? 0.32 : 0.14))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(color.opacity(0.4), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(color.opacity(selected ? 0.9 : 0.4), lineWidth: selected ? 1.5 : 1))
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.5 : 1)
+    }
+
+    private func keyButton(_ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color.textPrimary)
+                .frame(maxWidth: .infinity, minHeight: 40)
+                .background(Color.surfaceElevated)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.hairline, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(driving)
+        .opacity(driving ? 0.5 : 1)
     }
 }
 

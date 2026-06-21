@@ -246,6 +246,33 @@ export async function sendInput(terminalId, text, submit = true) {
   }
 }
 
+// Named special keys -> raw ANSI sequences, written through mobile.terminal.input
+// (the only input path that actually reaches a cmux terminal — `cmux send-key
+// --surface <uuid>` reports "Surface is not a terminal" for mobile terminals).
+// Used to drive interactive TUI pickers (e.g. codex's "/model" popup) from the
+// phone: arrows to move, enter to accept, escape to back out.
+const KEY_SEQUENCES = {
+  up: "\x1b[A",
+  down: "\x1b[B",
+  right: "\x1b[C",
+  left: "\x1b[D",
+  enter: "\r",
+  escape: "\x1b",
+  tab: "\t",
+  backspace: "\x7f",
+};
+
+export function isNamedKey(key) {
+  return Object.prototype.hasOwnProperty.call(KEY_SEQUENCES, key);
+}
+
+export async function sendNamedKey(terminalId, key) {
+  if (!CMUX_BIN || !terminalId) throw new Error("missing terminal id");
+  const seq = KEY_SEQUENCES[key];
+  if (seq === undefined) throw new Error(`unsupported key: ${key}`);
+  await rpc("mobile.terminal.input", { terminal_id: terminalId, text: seq });
+}
+
 // Stream cmux events (newline-delimited JSON). Calls onEvent(obj) per frame.
 // Auto-reconnects (cmux --reconnect); the caller should respawn if the child
 // exits (e.g. before the socket is reachable). Returns the child process.

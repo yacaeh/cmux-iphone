@@ -135,11 +135,20 @@ final class BridgeClient {
     // MARK: - Commands
 
     /// Sends a text command to a session's PTY, or directly to a cmux terminal.
-    func sendCommand(text: String, sessionId: String? = nil, terminalId: String? = nil) async throws {
-        var body: [String: Any] = ["command": text]
+    /// `submit` appends Enter (default). Pass `submit: false` to type without
+    /// submitting — e.g. a single digit to pick a row in an interactive picker.
+    func sendCommand(text: String, sessionId: String? = nil, terminalId: String? = nil, submit: Bool = true) async throws {
+        var body: [String: Any] = ["command": text, "submit": submit]
         if let sid = sessionId { body["sessionId"] = sid }
         if let tid = terminalId { body["terminalId"] = tid }
         try await authenticatedPostRaw(path: "command", body: body)
+    }
+
+    /// Sends a named special key (up/down/left/right/enter/escape/tab/backspace)
+    /// to a cmux terminal — used to drive interactive TUI pickers like codex's
+    /// `/model` popup from the phone.
+    func sendKey(terminalId: String, key: String) async throws {
+        try await authenticatedPostRaw(path: "command", body: ["key": key, "terminalId": terminalId])
     }
 
     /// Fetches the live cmux workspace/terminal tree (raw JSON data).
