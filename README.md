@@ -287,4 +287,9 @@ The `setup-hooks.sh` script installs these HTTP hooks globally in `~/.claude/set
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
+
+Agent Watch is a fork of [shobhit99/claude-watch](https://github.com/shobhit99/claude-watch)
+(MIT); original-author copyright is preserved. See [`NOTICE.md`](NOTICE.md) for
+attribution and trademark notes ("Claude" and its logo are Anthropic trademarks;
+this is an independent community tool, not affiliated with Anthropic).
