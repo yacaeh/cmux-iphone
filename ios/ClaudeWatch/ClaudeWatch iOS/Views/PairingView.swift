@@ -316,6 +316,8 @@ struct PairingView: View {
             }
         case .serverError(let msg):
             showPairingError(msg)
+        case .screenChanged:
+            showPairingError("다시 시도하세요.")
         }
     }
 

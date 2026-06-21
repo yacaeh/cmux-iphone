@@ -155,6 +155,35 @@ export async function sendKey(surface, key) {
   await cmux(["send-key", "--surface", surface, key]);
 }
 
+// Resolve a session's cwd to a live cmux TERMINAL UUID (not a surface ref).
+// Uses mobile.workspace.list (which works for mobile terminals, unlike `cmux
+// top`) so the result can be fed to screenHash/readTerminalText/sendInput. This
+// is what pins a codex approval to a specific terminal + screen hash.
+export async function resolveTerminalId(cwd) {
+  const data = await mobileWorkspaces();
+  if (!data || !Array.isArray(data.workspaces)) return null;
+  const target = norm(cwd);
+  const terms = [];
+  for (const w of data.workspaces) {
+    if (w.title === "Agent Bridge") continue;
+    for (const t of w.terminals || []) {
+      terms.push({ id: t.id, cwd: norm(t.current_directory) });
+    }
+  }
+  if (terms.length === 0) return null;
+  if (target) {
+    const exact = terms.find((t) => t.cwd === target);
+    if (exact) return exact.id;
+    const rel = terms.find(
+      (t) => t.cwd && (target.startsWith(t.cwd + "/") || t.cwd.startsWith(target + "/"))
+    );
+    if (rel) return rel.id;
+  }
+  // Exactly one terminal overall — unambiguous.
+  if (terms.length === 1) return terms[0].id;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Mobile mirror API (cmux rpc) — drives the phone's live cmux view.
 // ---------------------------------------------------------------------------

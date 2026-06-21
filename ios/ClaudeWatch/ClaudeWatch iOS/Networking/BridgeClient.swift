@@ -23,6 +23,7 @@ final class BridgeClient {
         case expired
         case rateLimited
         case networkError
+        case screenChanged
         case serverError(String)
 
         var errorDescription: String? {
@@ -31,6 +32,7 @@ final class BridgeClient {
             case .expired:          return "Pairing code expired."
             case .rateLimited:      return "Too many attempts. Try again later."
             case .networkError:     return "Cannot reach bridge server."
+            case .screenChanged:    return "Screen changed before the answer landed."
             case .serverError(let msg): return msg
             }
         }
@@ -229,42 +231,52 @@ final class BridgeClient {
         return json?["sessionId"] as? String ?? ""
     }
 
+    /// Attaches the live-terminal pin (terminalId + expectedScreenHash) to an
+    /// approval body so the bridge can refuse (409) if the screen changed.
+    private func pin(_ body: inout [String: Any], terminalId: String?, expectedScreenHash: String?) {
+        if let tid = terminalId { body["terminalId"] = tid }
+        if let h = expectedScreenHash { body["expectedScreenHash"] = h }
+    }
+
     /// Responds to an approval request.
-    func respondToApproval(requestId: String, allow: Bool) async throws {
+    func respondToApproval(requestId: String, allow: Bool, terminalId: String? = nil, expectedScreenHash: String? = nil) async throws {
         var decision: [String: Any] = [
             "behavior": allow ? "allow" : "deny"
         ]
         if !allow {
             decision["message"] = "Denied from Agent Watch app"
         }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "permissionId": requestId,
             "decision": decision
         ]
+        pin(&body, terminalId: terminalId, expectedScreenHash: expectedScreenHash)
         try await authenticatedPostRaw(path: "command", body: body)
     }
 
     /// Responds to an approval with a selected option (for dynamic options / AskUserQuestion).
-    func respondToApprovalWithOption(requestId: String, optionLabel: String, index: Int) async throws {
-        let body: [String: Any] = [
+    func respondToApprovalWithOption(requestId: String, optionLabel: String, index: Int, terminalId: String? = nil, expectedScreenHash: String? = nil) async throws {
+        var body: [String: Any] = [
             "permissionId": requestId,
             "decision": ["behavior": "allow"],
             "selectedOption": optionLabel,
             "optionIndex": index
         ]
+        pin(&body, terminalId: terminalId, expectedScreenHash: expectedScreenHash)
         try await authenticatedPostRaw(path: "command", body: body)
     }
 
     /// Responds with "allow" + adds a permission rule so it doesn't ask again this session.
-    func respondToApprovalAllowAll(requestId: String) async throws {
+    func respondToApprovalAllowAll(requestId: String, terminalId: String? = nil, expectedScreenHash: String? = nil) async throws {
         let decision: [String: Any] = [
             "behavior": "allow"
         ]
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "permissionId": requestId,
             "decision": decision,
             "allowAll": true
         ]
+        pin(&body, terminalId: terminalId, expectedScreenHash: expectedScreenHash)
         try await authenticatedPostRaw(path: "command", body: body)
     }
 
@@ -322,9 +334,14 @@ final class BridgeClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (_, response) = try await performRequest(request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
-            throw BridgeError.serverError("Request failed")
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw BridgeError.networkError
+        }
+        // 409 = the bridge refused because the terminal screen changed since the
+        // user was shown the approval (expectedScreenHash mismatch).
+        if httpResponse.statusCode == 409 { throw BridgeError.screenChanged }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw BridgeError.serverError("Request failed (HTTP \(httpResponse.statusCode))")
         }
     }
 

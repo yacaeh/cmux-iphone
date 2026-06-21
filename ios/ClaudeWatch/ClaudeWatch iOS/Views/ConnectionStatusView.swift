@@ -1542,6 +1542,23 @@ private struct SessionDetailView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .disabled(approval.status == .submitting)
+                .opacity(approval.status == .submitting ? 0.5 : 1)
+            }
+
+            if approval.status == .submitting {
+                HStack(spacing: 6) {
+                    ProgressView().scaleEffect(0.7)
+                    Text("전송 중…").font(.system(size: 12)).foregroundStyle(Color.subtleText)
+                }
+            } else if approval.status == .failed {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 12)).foregroundStyle(Color.denyRed)
+                    Text(approval.lastError ?? "전송 실패 — 다시 시도하세요")
+                        .font(.system(size: 12)).foregroundStyle(Color.denyRed)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             HStack(spacing: 8) {

@@ -275,10 +275,27 @@ async function respond(p, opt, i){
   else if(/allow all|don't ask/i.test(opt.label)){ body={ permissionId:p.permissionId, decision:{behavior:'allow'}, allowAll:true }; }
   else if(last){ body={ permissionId:p.permissionId, decision:{behavior:'deny'} }; }
   else { body={ permissionId:p.permissionId, decision:{behavior:'allow'} }; }
-  const s = sessions.get(activeId); if(s) s.pending=null;
-  push(activeId,[{t:'→ '+opt.label, c:last&&!p.question?'error':'command'}]);
-  render();
-  try{ await post('/command', body); }catch(e){}
+  const s = sessions.get(activeId);
+  if(p.submitting) return;        // already in flight
+  p.submitting = true; p.error = null; render();
+  try{
+    const r = await post('/command', body);
+    if(!r.ok){
+      // 409 = screen changed; other = bridge refused. Keep the card, allow retry.
+      p.submitting = false;
+      p.error = (r.status===409) ? '화면이 바뀌었습니다 — 다시 시도하세요' : ('승인 전송 실패 ('+r.status+')');
+      render();
+      return;
+    }
+    if(s) s.pending=null;          // confirmed — clear only now
+    push(activeId,[{t:'→ '+opt.label, c:last&&!p.question?'error':'command'}]);
+    render();
+  }catch(e){
+    p.submitting = false;
+    p.error = '브리지에 연결할 수 없습니다 — 다시 시도하세요';
+    push(activeId,[{t:'✗ 승인 전송 실패',c:'error'}]);
+    render();
+  }
 }
 
 /* ---------- send prompt ---------- */
@@ -323,9 +340,18 @@ function renderApprove(){
     const last=i===p.opts.length-1;
     const b=document.createElement('button'); b.className='opt'+(last&&!p.question?' deny':'');
     b.innerHTML='<b>'+esc(opt.label)+'</b>'+(opt.sub?'<small>'+esc(opt.sub)+'</small>':'');
+    b.disabled = !!p.submitting;
+    if(p.submitting) b.style.opacity='0.5';
     b.onclick=()=>respond(p,opt,i);
     o.appendChild(b);
   });
+  if(p.submitting){
+    const d=document.createElement('div'); d.style.cssText='font-size:12px;color:#888;margin-top:6px'; d.textContent='전송 중…';
+    o.appendChild(d);
+  } else if(p.error){
+    const d=document.createElement('div'); d.style.cssText='font-size:12px;color:#e5534b;margin-top:6px'; d.textContent=p.error;
+    o.appendChild(d);
+  }
   ap.classList.remove('hidden');
 }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }

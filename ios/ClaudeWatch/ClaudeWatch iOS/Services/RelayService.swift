@@ -516,6 +516,10 @@ final class RelayService: ObservableObject {
 
         let reason = toolInput["reason"] as? String ?? (json["reason"] as? String)
         let session = sessionId.flatMap { sid in sessions.first(where: { $0.id == sid }) }
+        // Live-terminal pin (codex/cmux approvals): the bridge snapshots the
+        // terminal + its screen hash so the answer can't land on a wrong/changed screen.
+        let terminalId = json["terminalId"] as? String
+        let expectedHash = json["screenHash"] as? String ?? (json["expectedScreenHash"] as? String)
         let approval = ApprovalRequest(
             permissionId: permissionId,
             toolName: toolName,
@@ -526,7 +530,9 @@ final class RelayService: ObservableObject {
             macName: machineName,
             cwd: session?.cwd,
             agent: session?.agent.rawValue ?? (json["source"] as? String),
-            reason: reason
+            reason: reason,
+            terminalId: terminalId,
+            expectedScreenHash: expectedHash
         )
 
         // Ignore re-sends of an approval we've already answered/cleared.
@@ -577,36 +583,77 @@ final class RelayService: ObservableObject {
     /// is shown in both the queue sheet and a session detail.
     func respond(to approval: ApprovalRequest, optionLabel: String, index: Int) {
         let permissionId = approval.permissionId ?? ""
-        if !permissionId.isEmpty {
-            if resolvedPermissionIds.contains(permissionId) { return } // already answered
-            resolvedPermissionIds.insert(permissionId)
-        }
+        // Transactional: don't double-submit, and don't re-answer a resolved id.
+        // The card is removed ONLY after the bridge confirms (HTTP 2xx).
+        if currentStatus(of: approval) == .submitting { return }
+        if !permissionId.isEmpty, resolvedPermissionIds.contains(permissionId) { return }
 
         let isLast = index == approval.options.count - 1
         UIImpactFeedbackGenerator(style: isLast ? .heavy : .medium).impactOccurred()
+        setStatus(.submitting, for: approval)
 
-        if approval.question != nil {
-            // AskUserQuestion: send the option label (index -1 == freeform text)
-            Task {
-                try? await bridgeClient.respondToApprovalWithOption(
-                    requestId: permissionId, optionLabel: optionLabel, index: index
-                )
-            }
-        } else {
-            // Standard permission: first = allow, last = deny, middle = allow all
-            if optionLabel.lowercased().contains("allow all") || optionLabel.lowercased().contains("don't ask") {
-                Task { try? await bridgeClient.respondToApprovalAllowAll(requestId: permissionId) }
-            } else {
-                let approved = !isLast
-                Task { try? await bridgeClient.respondToApproval(requestId: permissionId, allow: approved) }
+        let tid = approval.terminalId
+        let hash = approval.expectedScreenHash
+        Task { @MainActor in
+            do {
+                if approval.question != nil {
+                    // AskUserQuestion: send the option label (index -1 == freeform text)
+                    try await bridgeClient.respondToApprovalWithOption(
+                        requestId: permissionId, optionLabel: optionLabel, index: index,
+                        terminalId: tid, expectedScreenHash: hash)
+                } else if optionLabel.lowercased().contains("allow all") || optionLabel.lowercased().contains("don't ask") {
+                    try await bridgeClient.respondToApprovalAllowAll(
+                        requestId: permissionId, terminalId: tid, expectedScreenHash: hash)
+                } else {
+                    try await bridgeClient.respondToApproval(
+                        requestId: permissionId, allow: !isLast, terminalId: tid, expectedScreenHash: hash)
+                }
+                // Success — only NOW mark resolved + remove the card.
+                if !permissionId.isEmpty { resolvedPermissionIds.insert(permissionId) }
+                let line = TerminalLine(text: "→ \(optionLabel)", type: isLast ? .error : .output)
+                terminalBuffer.append(line)
+                recentTerminalLines = terminalBuffer.getLast(15)
+                clearPendingApproval(for: approval)
+            } catch {
+                // Failure — keep the card, surface the error, allow retry.
+                setStatus(.failed, for: approval, error: friendlyError(error))
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                let line = TerminalLine(text: "✗ 승인 전송 실패 — 다시 시도하세요", type: .error)
+                terminalBuffer.append(line)
+                recentTerminalLines = terminalBuffer.getLast(15)
             }
         }
+    }
 
-        let line = TerminalLine(text: "→ \(optionLabel)", type: isLast ? .error : .output)
-        terminalBuffer.append(line)
-        recentTerminalLines = terminalBuffer.getLast(15)
+    /// Live status of an approval (the `approval` argument is a value snapshot).
+    private func currentStatus(of approval: ApprovalRequest) -> ApprovalRequest.ApprovalStatus {
+        approvalQueue.first(where: { $0.dedupeKey == approval.dedupeKey })?.status ?? approval.status
+    }
 
-        clearPendingApproval(for: approval)
+    /// Update an approval's status (+optional error) in BOTH the queue and the
+    /// owning session — ApprovalRequest is a value type, so we patch every copy.
+    private func setStatus(_ status: ApprovalRequest.ApprovalStatus, for approval: ApprovalRequest, error: String? = nil) {
+        if let i = approvalQueue.firstIndex(where: { $0.dedupeKey == approval.dedupeKey }) {
+            approvalQueue[i].status = status
+            approvalQueue[i].lastError = error
+        }
+        pendingApproval = approvalQueue.first
+        for i in sessions.indices where sessions[i].pendingApproval?.permissionId == approval.permissionId {
+            sessions[i].pendingApproval?.status = status
+            sessions[i].pendingApproval?.lastError = error
+        }
+    }
+
+    private func friendlyError(_ error: Error) -> String {
+        if let be = error as? BridgeClient.BridgeError {
+            switch be {
+            case .screenChanged: return "화면이 바뀌었습니다 — 다시 확인 후 시도하세요"
+            case .networkError:  return "브리지에 연결할 수 없습니다"
+            case .rateLimited:   return "잠시 후 다시 시도하세요"
+            default:             return be.errorDescription ?? "전송 실패"
+            }
+        }
+        return "전송 실패"
     }
 
     /// Back-compat: respond to the current head of the queue.
@@ -618,13 +665,25 @@ final class RelayService: ObservableObject {
     /// Explicit "allow for this session" — adds a permission rule so it won't ask again.
     func respondAllowSession(_ approval: ApprovalRequest) {
         let permissionId = approval.permissionId ?? ""
-        if !permissionId.isEmpty {
-            if resolvedPermissionIds.contains(permissionId) { return }
-            resolvedPermissionIds.insert(permissionId)
-        }
+        if currentStatus(of: approval) == .submitting { return }
+        if !permissionId.isEmpty, resolvedPermissionIds.contains(permissionId) { return }
+
         UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-        Task { try? await bridgeClient.respondToApprovalAllowAll(requestId: permissionId) }
-        clearPendingApproval(for: approval)
+        setStatus(.submitting, for: approval)
+
+        let tid = approval.terminalId
+        let hash = approval.expectedScreenHash
+        Task { @MainActor in
+            do {
+                try await bridgeClient.respondToApprovalAllowAll(
+                    requestId: permissionId, terminalId: tid, expectedScreenHash: hash)
+                if !permissionId.isEmpty { resolvedPermissionIds.insert(permissionId) }
+                clearPendingApproval(for: approval)
+            } catch {
+                setStatus(.failed, for: approval, error: friendlyError(error))
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+        }
     }
 
     // MARK: - Send command

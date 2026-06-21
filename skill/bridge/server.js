@@ -674,7 +674,7 @@ function recordCodexExecApprovalCandidate(line) {
   });
 }
 
-function surfaceCodexExecApproval(sessionId) {
+async function surfaceCodexExecApproval(sessionId) {
   const slot = sessions.get(sessionId);
   const candidate = codexExecApprovalCandidates.get(sessionId);
   if (!slot || !candidate) return;
@@ -682,12 +682,26 @@ function surfaceCodexExecApproval(sessionId) {
   const existingId = codexSyntheticPermissionBySession.get(sessionId);
   if (existingId) return;
 
+  // Pin the live terminal + snapshot its screen hash, so the phone can echo the
+  // hash back and the bridge refuses (409) if the screen changed before the
+  // answer lands — and so the answer goes to THIS terminal, not a cwd lookup.
+  let terminalId = null;
+  let screenHash = null;
+  if (cmux.cmuxAvailable()) {
+    try {
+      terminalId = await cmux.resolveTerminalId(slot.cwd);
+      if (terminalId) screenHash = await cmux.screenHash(terminalId);
+    } catch { /* fall back to unpinned (cwd-resolved) behavior */ }
+  }
+
   const permissionId = crypto.randomUUID();
   const options = buildCodexApprovalOptions(candidate.prefixRule);
   const payload = {
     permissionId,
     source: "codex",
     tool_name: "ExecApproval",
+    terminalId,
+    screenHash,
     tool_input: {
       command: candidate.command,
       workdir: candidate.workdir,
@@ -700,12 +714,12 @@ function surfaceCodexExecApproval(sessionId) {
       ],
     },
   };
-  codexSyntheticPermissions.set(permissionId, { sessionId, optionCount: options.length, payload });
+  codexSyntheticPermissions.set(permissionId, { sessionId, optionCount: options.length, terminalId, screenHash, payload });
   codexSyntheticPermissionBySession.set(sessionId, permissionId);
 
   pushSseEvent("permission-request", payload, sessionId);
 
-  log("info", `Surfaced Codex approval ${permissionId} for session ${sessionId}`);
+  log("info", `Surfaced Codex approval ${permissionId} for session ${sessionId}${terminalId ? ` (terminal ${terminalId.slice(0, 8)})` : ""}`);
 }
 
 function clearCodexSyntheticPermissionForSession(sessionId, reason = "cleared") {
@@ -719,33 +733,46 @@ function clearCodexSyntheticPermissionForSession(sessionId, reason = "cleared") 
   return true;
 }
 
-async function resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex) {
+async function resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex, opts = {}) {
   const synthetic = codexSyntheticPermissions.get(permissionId);
   if (!synthetic) return false;
 
   const slot = sessions.get(synthetic.sessionId);
   if (!slot) return false;
 
-  // Preferred: answer the approval by typing into the LIVE codex cmux surface,
-  // instead of attaching a second process via `codex resume`.
+  const idx = Number.isInteger(optionIndex) ? optionIndex : -1;
+  const proceed = idx === 0 || /^yes,?\s*proceed/i.test(String(selectedOption || ""));
+  const dontAsk = synthetic.optionCount === 3
+    && (idx === 1 || /^yes,?\s*don't ask again/i.test(String(selectedOption || "")));
+
+  // Preferred: type into the LIVE codex terminal that was PINNED when the
+  // approval was surfaced (by UUID, not a fresh cwd lookup), guarded by the
+  // screen hash so an answer can't land on a wrong/changed screen.
   if (cmux.cmuxAvailable()) {
-    const idx = Number.isInteger(optionIndex) ? optionIndex : -1;
-    const proceed = idx === 0 || /^yes,?\s*proceed/i.test(String(selectedOption || ""));
-    const dontAsk = synthetic.optionCount === 3
-      && (idx === 1 || /^yes,?\s*don't ask again/i.test(String(selectedOption || "")));
-    const surface = await cmux.resolveSurface(slot.cwd, "codex");
-    if (surface) {
+    const terminalId = synthetic.terminalId || opts.terminalId || (await cmux.resolveTerminalId(slot.cwd));
+    if (terminalId) {
+      // If the phone pinned a different terminal than we surfaced on, refuse.
+      if (opts.terminalId && synthetic.terminalId && opts.terminalId !== synthetic.terminalId) {
+        return { conflict: true, reason: "terminal-mismatch" };
+      }
+      // Screen-hash guard: refuse (409) if the screen changed since the user saw it.
+      if (opts.expectedScreenHash) {
+        const currentHash = await cmux.screenHash(terminalId);
+        if (currentHash !== opts.expectedScreenHash) {
+          return { conflict: true, reason: "screen-changed", currentHash };
+        }
+      }
       try {
         if (proceed) {
-          await cmux.sendChars(surface, "y");
+          await cmux.sendInput(terminalId, "y", false);
         } else if (dontAsk) {
-          await cmux.sendChars(surface, "2");
-          await cmux.sendKey(surface, "enter");
+          await cmux.sendInput(terminalId, "2", false);
+          await cmux.sendNamedKey(terminalId, "enter");
         } else {
-          await cmux.sendKey(surface, "escape"); // deny / cancel
+          await cmux.sendNamedKey(terminalId, "escape"); // deny / cancel
         }
         clearCodexSyntheticPermissionForSession(synthetic.sessionId, "resolved");
-        log("info", `cmux codex approval ${permissionId} -> ${surface} (${slot.cwd})`);
+        log("info", `cmux codex approval ${permissionId} -> terminal ${terminalId.slice(0, 8)} (${slot.cwd})`);
         return true;
       } catch (err) {
         log("warn", `cmux codex approval failed (${err.message}); falling back to PTY`);
@@ -915,7 +942,7 @@ function scanCodexSessionFiles() {
   }
 }
 
-function consumeCodexLogChunk(text) {
+async function consumeCodexLogChunk(text) {
   const combined = codexLogState.remainder + text;
   const lines = combined.split("\n");
   codexLogState.remainder = lines.pop() ?? "";
@@ -927,7 +954,7 @@ function consumeCodexLogChunk(text) {
     if (approvalMatch) {
       const [, sessionId, state] = approvalMatch;
       if (state === "new") {
-        surfaceCodexExecApproval(sessionId);
+        await surfaceCodexExecApproval(sessionId);
       } else {
         clearCodexSyntheticPermissionForSession(sessionId, "closed");
       }
@@ -943,7 +970,7 @@ function consumeCodexLogChunk(text) {
   }
 }
 
-function scanCodexLog() {
+async function scanCodexLog() {
   const stat = safeStat(CODEX_LOG_FILE);
   if (!stat || !stat.isFile()) return;
 
@@ -955,7 +982,7 @@ function scanCodexLog() {
     codexLogState.remainder = "";
     codexLogState.initialized = true;
     if (bootstrapText) {
-      consumeCodexLogChunk(bootstrapText);
+      await consumeCodexLogChunk(bootstrapText);
     }
     return;
   }
@@ -968,22 +995,22 @@ function scanCodexLog() {
 
   const text = readFileSlice(CODEX_LOG_FILE, codexLogState.offset, stat.size - codexLogState.offset);
   codexLogState.offset = stat.size;
-  consumeCodexLogChunk(text);
+  await consumeCodexLogChunk(text);
 }
 
 function startCodexMonitor() {
   if (codexMonitorInterval) return;
 
   scanCodexSessionFiles();
-  scanCodexLog();
+  scanCodexLog().catch((err) => log("warn", `Codex log scan failed: ${err.message}`));
 
   codexMonitorInterval = setInterval(() => {
     try {
       scanCodexSessionFiles();
-      scanCodexLog();
     } catch (err) {
       log("warn", `Codex monitor scan failed: ${err.message}`);
     }
+    scanCodexLog().catch((err) => log("warn", `Codex log scan failed: ${err.message}`));
   }, CODEX_SESSION_SCAN_INTERVAL_MS);
 }
 
@@ -1202,9 +1229,20 @@ async function handleCommand(req, res) {
       }
     }
 
-    const resolvedSynthetic = await resolveCodexSyntheticPermission(permissionId, selectedOption, optionIndex);
-    if (resolvedSynthetic) {
+    const resolvedSynthetic = await resolveCodexSyntheticPermission(
+      permissionId, selectedOption, optionIndex,
+      { terminalId: body.terminalId, expectedScreenHash: body.expectedScreenHash }
+    );
+    if (resolvedSynthetic === true) {
       return jsonResponse(res, 200, { ok: true });
+    }
+    if (resolvedSynthetic && resolvedSynthetic.conflict) {
+      // Screen changed (or wrong terminal) — phone must re-check before answering.
+      return jsonResponse(res, 409, {
+        error: "screen-changed",
+        reason: resolvedSynthetic.reason,
+        currentHash: resolvedSynthetic.currentHash,
+      });
     }
 
     return jsonResponse(res, 404, { error: "No pending permission with that ID" });

@@ -160,7 +160,11 @@ struct ApprovalCard: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .disabled(approval.status == .submitting)
+                .opacity(approval.status == .submitting ? 0.5 : 1)
             }
+
+            statusFooter
         }
         .padding(12)
         .background(Color.cardBackground)
@@ -169,6 +173,31 @@ struct ApprovalCard: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.claudeAmber.opacity(0.4), lineWidth: 1)
         )
+    }
+
+    @ViewBuilder
+    private var statusFooter: some View {
+        switch approval.status {
+        case .submitting:
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.7)
+                Text("전송 중…")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.subtleText)
+            }
+        case .failed:
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.denyRed)
+                Text(approval.lastError ?? "전송 실패 — 위 버튼으로 다시 시도하세요")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.denyRed)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        default:
+            EmptyView()
+        }
     }
 
     private func colorForOption(_ index: Int, total: Int) -> Color {
