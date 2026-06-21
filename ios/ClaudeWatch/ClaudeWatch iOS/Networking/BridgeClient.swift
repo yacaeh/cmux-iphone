@@ -261,6 +261,11 @@ final class BridgeClient {
 
     // MARK: - Status
 
+    /// Toggle supervise mode (broad PreToolUse approval) on the bridge.
+    func setSupervise(on: Bool) async throws {
+        try await authenticatedPostRaw(path: "supervise", body: ["on": on])
+    }
+
     /// Fetches the current bridge status.
     func fetchStatus() async throws -> BridgeStatus {
         guard let baseURL else { throw BridgeError.networkError }
@@ -353,6 +358,7 @@ final class BridgeClient {
         let sseClients: Int
         let pendingPermissions: Int
         let eventBufferSize: Int
+        let supervise: Bool?
     }
 
     struct BridgeSessionInfo: Decodable {

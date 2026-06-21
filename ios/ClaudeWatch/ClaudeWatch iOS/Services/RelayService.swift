@@ -49,6 +49,10 @@ final class RelayService: ObservableObject {
     /// Bumped on every cmux event so terminal views refetch their screen live.
     @Published private(set) var cmuxScreenTick: Int = 0
 
+    /// Supervise mode — when ON, the bridge routes mutating tools through phone
+    /// approval (all permission modes). Mirrors the bridge's state.
+    @Published var superviseMode: Bool = false
+
     // MARK: - Private
 
     private let bridgeClient = BridgeClient()
@@ -270,6 +274,26 @@ final class RelayService: ObservableObject {
     /// Returns .screenChanged if the bridge rejected because the screen moved.
     func sendCmuxGuarded(terminalId: String, text: String, expectedScreenHash: String?, submit: Bool = true) async -> CmuxSendResult {
         await bridgeClient.sendCmuxGuarded(terminalId: terminalId, text: text, expectedScreenHash: expectedScreenHash, submit: submit)
+    }
+
+    // MARK: - Supervise mode
+
+    /// Toggle broad phone-approval (PreToolUse) on the bridge. Optimistic.
+    func setSupervise(_ on: Bool) {
+        superviseMode = on
+        Task {
+            do { try await bridgeClient.setSupervise(on: on) }
+            catch { await MainActor.run { self.refreshSupervise() } } // resync on failure
+        }
+    }
+
+    /// Sync the toggle with the bridge's actual state.
+    func refreshSupervise() {
+        Task { @MainActor in
+            if let st = try? await bridgeClient.fetchStatus() {
+                superviseMode = st.supervise ?? false
+            }
+        }
     }
 
     /// Start pairing an additional Mac (PairingView is shown over the list).

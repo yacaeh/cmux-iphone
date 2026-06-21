@@ -102,6 +102,10 @@ let rateLimitWindowStart = Date.now();
 
 // Bridge-level state: "idle" | "connected"
 let bridgeState = "idle";
+// Supervise mode: when ON, PreToolUse for mutating tools blocks for phone
+// approval (works in ALL permission modes, even auto/bypass). Default OFF so
+// normal sessions never block.
+let superviseMode = false;
 
 // Multi-session: each entry is a session slot
 // { id, agent, cwd, folderName, ptyProcess, state, createdAt }
@@ -1651,6 +1655,59 @@ async function handleHookSessionStart(req, res) {
   return jsonResponse(res, 200, { ok: true });
 }
 
+// PreToolUse — the broad, all-modes approval path. When supervise mode is OFF
+// we auto-allow instantly (no blocking). When ON, we surface the tool call to
+// the phone and block for an allow/deny, returning a PreToolUse permission
+// decision (works even in auto/bypassPermissions where PermissionRequest never
+// fires). The hook matcher (settings.json) limits this to mutating tools.
+async function handleHookPreToolUse(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    return jsonResponse(res, 400, { error: "Invalid JSON" });
+  }
+
+  const allowOutput = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" } };
+  if (!superviseMode) return jsonResponse(res, 200, allowOutput); // never block when off
+
+  req.socket.setTimeout(0); // long-lived blocking request (up to PERMISSION_TIMEOUT_MS)
+  const sid = resolveHookSession(body);
+  const permissionId = crypto.randomUUID();
+  log("info", `Hook: PreToolUse (supervise) ${permissionId}${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
+
+  pendingPermissionPayloads.set(permissionId, { permissionId, ...body, sessionId: sid });
+  pushSseEvent("permission-request", { permissionId, ...body }, sid);
+
+  const decision = await waitForPermission(permissionId);
+  const allow = decision.behavior === "allow";
+  log("info", `Hook: PreToolUse ${permissionId} -> ${allow ? "allow" : "deny"}`);
+  return jsonResponse(res, 200, {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: allow ? "allow" : "deny",
+      ...(decision.message ? { permissionDecisionReason: decision.message } : {}),
+    },
+  });
+}
+
+// Toggle supervise mode from the phone.
+async function handleSupervise(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    return jsonResponse(res, 400, { error: "Invalid JSON" });
+  }
+  superviseMode = !!body.on;
+  log("info", `Supervise mode -> ${superviseMode ? "ON" : "OFF"}`);
+  return jsonResponse(res, 200, { supervise: superviseMode });
+}
+
 function handleStatus(_req, res) {
   const mostRecentRunningSession = findMostRecentRunningSession();
   return jsonResponse(res, 200, {
@@ -1664,6 +1721,7 @@ function handleStatus(_req, res) {
     pendingPermissions: pendingPermissions.size + codexSyntheticPermissions.size,
     eventBufferSize: sseBuffer.length,
     cmuxAvailable: cmux.cmuxAvailable(),
+    supervise: superviseMode,
     // Backward compat: expose the most recent active session's info
     hasPty: findMostRecentActiveSession() !== null,
     activeAgent: mostRecentRunningSession?.agent || null,
@@ -1780,6 +1838,8 @@ const routes = {
   "POST /hooks/error": handleHookError,
   "POST /hooks/session-end": handleHookSessionEnd,
   "POST /hooks/session-start": handleHookSessionStart,
+  "POST /hooks/pre-tool-use": handleHookPreToolUse,
+  "POST /supervise": handleSupervise,
   "GET /status": handleStatus,
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,

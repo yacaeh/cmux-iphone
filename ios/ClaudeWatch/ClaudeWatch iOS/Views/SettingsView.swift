@@ -12,11 +12,13 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 connectionSection
+                superviseSection
                 macsSection
                 aboutSection
             }
             .scrollContentBackground(.hidden)
             .background(Color.appBackground)
+            .task { relayService.refreshSupervise() }
             .navigationTitle("설정")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -59,6 +61,29 @@ struct SettingsView: View {
                 .foregroundStyle(Color.mutedText)
         } footer: {
             Text("자동은 로컬 네트워크에서 Bonjour로 브리지를 검색합니다.")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(Color.subtleText)
+        }
+    }
+
+    private var superviseSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { relayService.superviseMode },
+                set: { relayService.setSupervise($0) }
+            )) {
+                Text("감독 모드")
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundStyle(Color.textPrimary)
+            }
+            .tint(Color.claudeOrange)
+            .listRowBackground(Color.cardBackground)
+        } header: {
+            Text("승인")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.mutedText)
+        } footer: {
+            Text("켜면 모든 모드에서 Bash·Edit·Write 등 변경 도구가 실행 전 폰 승인을 거칩니다(승인 큐에 표시). 끄면 평소대로 자동 진행됩니다.")
                 .font(.system(size: 12, weight: .regular))
                 .foregroundStyle(Color.subtleText)
         }

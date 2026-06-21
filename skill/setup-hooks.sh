@@ -113,6 +113,17 @@ new_hooks = {
             'timeout': 5
         }]
     }],
+    # Broad approval path: mutating tools route through the bridge, which blocks
+    # for phone approval only when supervise mode is ON (else auto-allows fast).
+    'PreToolUse': [{
+        'matcher': 'Bash|Edit|Write|MultiEdit|NotebookEdit',
+        'hooks': [{
+            'type': 'http',
+            'url': f'{BRIDGE}/hooks/pre-tool-use',
+            'headers': HEADERS,
+            'timeout': 600
+        }]
+    }],
     'SessionStart': [{
         'hooks': [{
             'type': 'http',
