@@ -124,6 +124,15 @@ struct ConnectionStatusView: View {
         .sheet(isPresented: $showApprovalQueue) {
             ApprovalQueueView().environmentObject(relayService)
         }
+        .onChange(of: relayService.pendingApprovalCount) { oldCount, newCount in
+            // Auto-present the approval card on ANY screen when a new one arrives
+            // (matches the LAN web client's popup UX). Auto-closes when cleared.
+            if newCount > oldCount {
+                showApprovalQueue = true
+            } else if newCount == 0 {
+                showApprovalQueue = false
+            }
+        }
         .alert("오피스 이름 변경", isPresented: Binding(
             get: { renameTarget != nil },
             set: { if !$0 { renameTarget = nil } }
