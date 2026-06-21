@@ -7,6 +7,8 @@ import { execSync } from "node:child_process";
 import { spawn as childSpawn } from "node:child_process";
 import { Bonjour } from "bonjour-service";
 import * as cmux from "./cmux.js";
+import { createDeviceStore } from "./lib/devices.js";
+import { paths as cfgPaths } from "./lib/config.js";
 
 // ---------------------------------------------------------------------------
 // Logging (must be defined before use)
@@ -95,7 +97,6 @@ try {
 // State
 // ---------------------------------------------------------------------------
 
-let sessionToken = null;
 let pairingCode = null;
 let pairingCodeExpiresAt = 0;
 
@@ -187,26 +188,16 @@ function loadOrCreateHookSecret() {
   return s;
 }
 
-function loadPersistedToken() {
-  try {
-    const t = fs.readFileSync(TOKEN_FILE, "utf-8").trim();
-    if (t) {
-      sessionToken = t;
-      log("info", "Restored session token from disk — existing pairing survives restart.");
-    }
-  } catch { /* no persisted token yet */ }
-}
+// Per-device bearer tokens (replaces the old single global token). Each paired
+// device gets its own revocable token; a legacy session-token file is migrated
+// into one device on first load. Persisted to devices.json (0600).
+const deviceStore = createDeviceStore(cfgPaths.devicesFile, cfgPaths.sessionTokenFile);
 
-function generateSessionToken() {
-  const token = crypto.randomBytes(32).toString("hex");
-  sessionToken = token;
-  try {
-    fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
-    fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
-  } catch (err) {
-    log("warn", `Could not persist session token: ${err.message}`);
+function loadPersistedToken() {
+  deviceStore.reload();
+  if (deviceStore.count() > 0) {
+    log("info", `Restored ${deviceStore.count()} paired device(s) from disk — pairings survive restart.`);
   }
-  return token;
 }
 
 function isRateLimited() {
@@ -231,7 +222,9 @@ function requireAuth(req) {
   const auth = req.headers["authorization"];
   if (!auth || !auth.startsWith("Bearer ")) return false;
   const token = auth.slice(7);
-  return token === sessionToken && sessionToken !== null;
+  if (!deviceStore.isValid(token)) return false;
+  deviceStore.touch(token);
+  return true;
 }
 
 function jsonResponse(res, status, body) {
@@ -1080,7 +1073,7 @@ async function handlePair(req, res) {
 
   recordRateLimitAttempt();
 
-  const { code } = body;
+  const { code, deviceName, deviceId } = body;
   if (!code || typeof code !== "string") {
     return jsonResponse(res, 400, { error: "Missing 'code' field" });
   }
@@ -1094,8 +1087,11 @@ async function handlePair(req, res) {
     return jsonResponse(res, 401, { error: "Invalid pairing code" });
   }
 
-  // Success
-  const token = generateSessionToken();
+  // Success — issue a NEW per-device token (existing devices stay paired).
+  const device = deviceStore.add({
+    name: typeof deviceName === "string" && deviceName.trim() ? deviceName.trim().slice(0, 60) : "iPhone",
+    id: typeof deviceId === "string" && deviceId.trim() ? deviceId.trim().slice(0, 100) : undefined,
+  });
   if (!FIXED_PAIRING_CODE) {
     pairingCode = null;
     pairingCodeExpiresAt = 0;
@@ -1103,9 +1099,10 @@ async function handlePair(req, res) {
   bridgeState = "connected";
   pushSseEvent("session", { state: "connected" });
 
-  log("info", "Watch paired successfully");
+  log("info", `Device paired: ${device.name} (${device.id.slice(0, 8)}) — ${deviceStore.count()} device(s) total`);
   return jsonResponse(res, 200, {
-    token,
+    token: device.token,
+    deviceId: device.id,
     bridgeId: BRIDGE_ID,
     sessionId: BRIDGE_ID, // backward compat
     machineName: os.hostname(),
@@ -1369,7 +1366,8 @@ function handleEvents(req, res) {
   // SSE: accept the token via header OR ?token= query (Safari EventSource can't set headers).
   const evUrl = new URL(req.url, `http://${req.headers.host}`);
   const qToken = evUrl.searchParams.get("token");
-  const tokenOk = requireAuth(req) || (qToken !== null && qToken === sessionToken && sessionToken !== null);
+  const tokenOk = requireAuth(req) || deviceStore.isValid(qToken);
+  if (qToken && deviceStore.isValid(qToken)) deviceStore.touch(qToken);
   if (!tokenOk) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
@@ -1793,9 +1791,43 @@ function handleStatus(req, res) {
     eventBufferSize: sseBuffer.length,
     cmuxAvailable: cmux.cmuxAvailable(),
     supervise: superviseMode,
+    pairedDevices: deviceStore.count(),
     // Backward compat: expose the most recent active session's info
     hasPty: findMostRecentActiveSession() !== null,
     activeAgent: mostRecentRunningSession?.agent || null,
+  });
+}
+
+// GET /devices — list paired devices (no token values). Auth required.
+function handleDevices(req, res) {
+  if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireAuth(req)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  return jsonResponse(res, 200, { devices: deviceStore.list() });
+}
+
+// POST /devices/revoke {deviceId} — revoke one device's token. Auth required.
+async function handleDevicesRevoke(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  if (!requireAuth(req)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  let body;
+  try { body = await readBody(req); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+  const id = body && typeof body.deviceId === "string" ? body.deviceId : null;
+  if (!id) return jsonResponse(res, 400, { error: "Missing 'deviceId'" });
+  const removed = deviceStore.revoke(id);
+  if (removed) log("info", `Device revoked: ${id.slice(0, 8)} — ${deviceStore.count()} device(s) remain`);
+  return jsonResponse(res, removed ? 200 : 404, removed ? { ok: true } : { error: "No device with that id" });
+}
+
+// GET /pair-code — the current pairing code, LOOPBACK-ONLY (for the local
+// agent-watch CLI). Not exposed to LAN clients, so it needs no token.
+function handlePairCode(req, res) {
+  const remote = req.socket.remoteAddress || "";
+  const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+  if (!isLoopback) return jsonResponse(res, 403, { error: "Loopback only" });
+  return jsonResponse(res, 200, {
+    code: pairingCode,
+    fixed: !!FIXED_PAIRING_CODE,
+    expiresAt: pairingCodeExpiresAt === Number.MAX_SAFE_INTEGER ? null : pairingCodeExpiresAt,
   });
 }
 
@@ -1808,7 +1840,8 @@ function handleWebClient(_req, res) {
 function authOk(req, url) {
   if (requireAuth(req)) return true;
   const q = url.searchParams.get("token");
-  return q !== null && q === sessionToken && sessionToken !== null;
+  if (deviceStore.isValid(q)) { deviceStore.touch(q); return true; }
+  return false;
 }
 
 // GET /cmux/tree — live cmux workspaces -> terminals for the mobile mirror.
@@ -1913,6 +1946,9 @@ const routes = {
   "POST /supervise": handleSupervise,
   "GET /health": handleHealth,
   "GET /status": handleStatus,
+  "GET /devices": handleDevices,
+  "POST /devices/revoke": handleDevicesRevoke,
+  "GET /pair-code": handlePairCode,
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,
 };
