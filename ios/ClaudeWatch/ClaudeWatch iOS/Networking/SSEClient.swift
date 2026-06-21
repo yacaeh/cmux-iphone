@@ -54,6 +54,12 @@ final class SSEClient {
     // Failure tracking for SSE -> polling fallback
     private var sseFailures: [Date] = []
 
+    // Connection generation: bumped on every (re)start and teardown. Delegate
+    // callbacks carry the generation they were created with and are ignored if
+    // stale — so cancelling a task (intentional stop, or a reconnect replacing
+    // an old stream) never triggers a phantom reconnect or leaks old data.
+    private var generation = 0
+
     // Buffer for parsing SSE lines
     private var lineBuffer = ""
     private var currentEventType: String?
@@ -85,6 +91,9 @@ final class SSEClient {
 
         guard let baseURL, let token else { return }
 
+        generation += 1
+        let myGeneration = generation
+
         let eventsURL = baseURL.appendingPathComponent("events")
         var request = URLRequest(url: eventsURL)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -95,7 +104,7 @@ final class SSEClient {
             request.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID")
         }
 
-        let delegate = SSESessionDelegate(client: self)
+        let delegate = SSESessionDelegate(client: self, generation: myGeneration)
         self.sessionDelegate = delegate
 
         let config = URLSessionConfiguration.default
@@ -113,6 +122,10 @@ final class SSEClient {
     }
 
     private func stopSSE() {
+        // Invalidate any in-flight callbacks: the task we're about to cancel will
+        // fire didCompleteWithError(cancelled) under the OLD generation, which the
+        // client handlers will ignore — no phantom reconnect.
+        generation += 1
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         dataTask?.cancel()
@@ -160,14 +173,17 @@ final class SSEClient {
     }
 
     private func reconnectOrFallback() {
-        stopSSE()
+        stopSSE()   // bumps generation
 
         if shouldFallbackToPolling() {
             startPolling()
         } else {
-            // Reconnect SSE after a brief delay
+            // Reconnect SSE after a brief delay — but only if we weren't
+            // intentionally stopped (disconnect) or superseded in the meantime.
+            let gen = generation
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.startSSE()
+                guard let self, self.generation == gen, self.baseURL != nil else { return }
+                self.startSSE()
             }
         }
     }
@@ -230,13 +246,15 @@ final class SSEClient {
 
     // MARK: - SSE Parsing
 
-    fileprivate func handleSSEConnected() {
+    fileprivate func handleSSEConnected(generation: Int) {
+        guard generation == self.generation else { return }
         DispatchQueue.main.async {
             self.state = .connected
         }
     }
 
-    fileprivate func handleReceivedData(_ data: Data) {
+    fileprivate func handleReceivedData(_ data: Data, generation: Int) {
+        guard generation == self.generation else { return }   // stale stream
         resetHeartbeatTimer()
 
         guard let text = String(data: data, encoding: .utf8) else { return }
@@ -306,13 +324,16 @@ final class SSEClient {
         }
     }
 
-    fileprivate func handleSSEError(_ error: Error?) {
+    fileprivate func handleSSEError(_ error: Error?, generation: Int) {
+        // Ignore callbacks from a superseded/cancelled stream (intentional stop
+        // or a reconnect that already replaced this task) — no phantom reconnect.
+        guard generation == self.generation else { return }
         recordSSEFailure()
         reconnectOrFallback()
     }
 
-    fileprivate func handleSSEComplete() {
-        // Stream ended gracefully -- reconnect
+    fileprivate func handleSSEComplete(generation: Int) {
+        guard generation == self.generation else { return }
         reconnectOrFallback()
     }
 }
@@ -322,9 +343,11 @@ final class SSEClient {
 private final class SSESessionDelegate: NSObject, URLSessionDataDelegate {
 
     private weak var client: SSEClient?
+    private let generation: Int
 
-    init(client: SSEClient) {
+    init(client: SSEClient, generation: Int) {
         self.client = client
+        self.generation = generation
     }
 
     func urlSession(
@@ -334,23 +357,23 @@ private final class SSESessionDelegate: NSObject, URLSessionDataDelegate {
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
         if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
-            client?.handleSSEConnected()
+            client?.handleSSEConnected(generation: generation)
             completionHandler(.allow)
         } else {
-            client?.handleSSEError(nil)
+            client?.handleSSEError(nil, generation: generation)
             completionHandler(.cancel)
         }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        client?.handleReceivedData(data)
+        client?.handleReceivedData(data, generation: generation)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error {
-            client?.handleSSEError(error)
+            client?.handleSSEError(error, generation: generation)
         } else {
-            client?.handleSSEComplete()
+            client?.handleSSEComplete(generation: generation)
         }
     }
 }

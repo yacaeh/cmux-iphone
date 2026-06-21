@@ -68,6 +68,7 @@ final class RelayService: ObservableObject {
     private var elapsedTimer: Timer?
     private var sessionStartDate: Date?
     private var sseRetryTimer: Timer?   // periodic SSE re-attempt while degraded to polling
+    private var macGeneration = 0       // bumped on every Mac switch/forget/unpair; guards late async results
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -238,10 +239,14 @@ final class RelayService: ObservableObject {
 
     /// Fetch the live cmux workspace/terminal tree.
     func refreshCmuxTree() {
+        let gen = macGeneration
         Task { @MainActor in
             do {
                 let data = try await bridgeClient.fetchCmuxTree()
                 let decoded = try JSONDecoder().decode(CmuxTreeResponse.self, from: data)
+                // Drop a response that arrived after a Mac switch — it belongs to
+                // the previous Mac and would repopulate stale workspaces.
+                guard gen == macGeneration else { return }
                 cmuxAvailable = decoded.available
                 cmuxWorkspaces = decoded.workspaces
             } catch {
@@ -337,6 +342,7 @@ final class RelayService: ObservableObject {
     /// forgetting a Mac never leaves the previous Mac's workspaces visible or
     /// tappable. Field-by-field reset previously drifted; centralize it here.
     private func resetPerMacState() {
+        macGeneration &+= 1   // invalidate in-flight per-Mac async results (e.g. refreshCmuxTree)
         sessions = []
         recentTerminalLines = []
         terminalBuffer.clear()
