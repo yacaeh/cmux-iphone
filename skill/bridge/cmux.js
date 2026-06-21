@@ -14,9 +14,10 @@
 //   3. Match the bridge session's cwd (from hooks) to find the surface ref.
 //   4. `cmux send --surface <ref> -- "<text>"` + `cmux send-key <ref> enter`.
 //
-// All cmux/lsof calls use execFileSync (no shell) so prompt text can never be
-// shell-injected. Every function is best-effort: on any failure it throws and
-// the caller falls back to the original detached behaviour.
+// All cmux/lsof calls use execFile (no shell) so prompt text can never be
+// shell-injected, and run async so they never block Node's event loop. Every
+// function is best-effort: on any failure it throws and the caller falls back
+// to the original detached behaviour.
 
 import { execFile, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
