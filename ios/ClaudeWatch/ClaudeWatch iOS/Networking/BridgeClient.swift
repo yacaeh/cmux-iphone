@@ -175,10 +175,10 @@ final class BridgeClient {
     /// Send input to a cmux terminal, guarded by the screen hash the phone last
     /// rendered. The bridge refuses (409) if the screen changed since — so an
     /// approval "yes"/"no" can't land on a different prompt.
-    func sendCmuxGuarded(terminalId: String, text: String, expectedScreenHash: String?) async -> CmuxSendResult {
+    func sendCmuxGuarded(terminalId: String, text: String, expectedScreenHash: String?, submit: Bool = true) async -> CmuxSendResult {
         guard let baseURL, let token else { return .failed("not paired") }
         let url = baseURL.appendingPathComponent("command")
-        var body: [String: Any] = ["command": text, "terminalId": terminalId]
+        var body: [String: Any] = ["command": text, "terminalId": terminalId, "submit": submit]
         if let h = expectedScreenHash { body["expectedScreenHash"] = h }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

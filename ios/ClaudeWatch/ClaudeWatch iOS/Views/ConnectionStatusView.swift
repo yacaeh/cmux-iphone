@@ -647,27 +647,19 @@ private struct CmuxTerminalView: View {
     @FocusState private var inputFocused: Bool
     private let pollTimer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
-    // Heuristic: does the current screen look like an approval prompt? Only used
-    // to decide whether to hash-guard the send (false positives just make the
-    // send stricter; false negatives behave like before — no safety regression).
-    private var isApprovalScreen: Bool {
-        let s = screen.lowercased()
-        if s.contains("esc to interrupt") { return false } // agent busy, not an approval
-        let markers = ["yes, proceed", "1. yes", "allow this command", "do you want to proceed",
-                       "approve?", "(y/n)", "[y/n", "approval", "승인", "허용하"]
-        return markers.contains { s.contains($0) }
-    }
-
     var body: some View {
         ZStack {
             Color.appBackground.ignoresSafeArea()
-            VStack(spacing: 0) {
-                screenView
+            VStack(spacing: 10) {
+                terminalCard
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
-                if changedNotice { noticeBar } else if isApprovalScreen { approvalBanner }
+                if changedNotice { noticeBar }
+                quickKeys
+                    .padding(.horizontal, 12)
                 inputBar
-                    .padding(12)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
             }
         }
         .navigationTitle(title)
@@ -684,16 +676,48 @@ private struct CmuxTerminalView: View {
         }
     }
 
-    private var approvalBanner: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "shield.lefthalf.filled").foregroundStyle(Color.claudeAmber)
-            Text("승인 화면 감지 — 현재 화면 기준으로 안전 전송됩니다")
-                .font(.system(size: 11))
-                .foregroundStyle(Color.claudeAmber)
-            Spacer()
+    // MARK: terminal card (chrome + screen)
+
+    private var terminalCard: some View {
+        VStack(spacing: 0) {
+            // window header — traffic lights + title
+            HStack(spacing: 6) {
+                Circle().fill(Color.denyRed.opacity(0.85)).frame(width: 10, height: 10)
+                Circle().fill(Color.claudeAmber.opacity(0.85)).frame(width: 10, height: 10)
+                Circle().fill(Color.statusGreen.opacity(0.85)).frame(width: 10, height: 10)
+                Text(title)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.subtleText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.leading, 6)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(Color.surfaceElevated)
+
+            Rectangle().fill(Color.hairline).frame(height: 1)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(screen.isEmpty ? "…" : screen)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(Color.textPrimary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(12)
+                    Color.clear.frame(height: 1).id("bottom")
+                }
+                .onChange(of: screen) { _, _ in
+                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 6)
+        .frame(maxWidth: .infinity)
+        .background(Color.cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.hairline, lineWidth: 1))
     }
 
     private var noticeBar: some View {
@@ -705,27 +729,37 @@ private struct CmuxTerminalView: View {
             Spacer()
         }
         .padding(.horizontal, 14)
-        .padding(.top, 6)
     }
 
-    private var screenView: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(screen.isEmpty ? "…" : screen)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Color.textPrimary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(12)
-                Color.clear.frame(height: 1).id("bottom")
+    // MARK: quick response keys (hash-guarded — safe for approval prompts)
+
+    private var quickKeys: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                keyChip("예 y", "y", Color.statusGreen)
+                keyChip("아니오 n", "n", Color.denyRed)
+                keyChip("1", "1", Color.claudeOrange)
+                keyChip("2", "2", Color.claudeOrange)
+                keyChip("3", "3", Color.claudeOrange)
+                keyChip("⏎", "", Color.subtleText)
+                keyChip("Esc", "\u{1B}", Color.subtleText, submit: false)
             }
-            .onChange(of: screen) { _, _ in
-                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
-            }
+            .padding(.horizontal, 2)
         }
-        .frame(maxWidth: .infinity)
-        .background(Color.cardBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func keyChip(_ label: String, _ text: String, _ color: Color, submit: Bool = true) -> some View {
+        Button { sendKey(text, submit: submit) } label: {
+            Text(label)
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .foregroundStyle(color)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(color.opacity(0.12))
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(color.opacity(0.35), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private var inputBar: some View {
@@ -755,39 +789,36 @@ private struct CmuxTerminalView: View {
         }
     }
 
+    // A discrete key/answer → hash-guarded so it can't land on a changed screen.
+    private func sendKey(_ text: String, submit: Bool) {
+        let expected = screenHash
+        Task {
+            let result = await relayService.sendCmuxGuarded(terminalId: terminalId, text: text, expectedScreenHash: expected, submit: submit)
+            switch result {
+            case .sent:
+                changedNotice = false
+            case .screenChanged(let newText, let newHash):
+                screen = newText
+                screenHash = newHash
+                changedNotice = true
+            case .failed:
+                break
+            }
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            await refresh()
+        }
+    }
+
+    // Free-text prompt → unguarded (the screen is expected to keep changing).
     private func send() {
         let t = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-
-        // Approval screen → hash-guarded send so the response can't land on a
-        // changed screen. Normal prompt → fire-and-forget (screen keeps moving).
-        if isApprovalScreen {
-            let expected = screenHash
-            Task {
-                let result = await relayService.sendCmuxGuarded(terminalId: terminalId, text: t, expectedScreenHash: expected)
-                switch result {
-                case .sent:
-                    promptText = ""
-                    inputFocused = false
-                    changedNotice = false
-                case .screenChanged(let newText, let newHash):
-                    screen = newText            // show what's actually on screen now
-                    screenHash = newHash
-                    changedNotice = true        // keep promptText so the user can re-confirm
-                case .failed:
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                await refresh()
-            }
-        } else {
-            relayService.sendCmux(terminalId: terminalId, text: t)
-            promptText = ""
-            inputFocused = false
-            Task {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                await refresh()
-            }
+        relayService.sendCmux(terminalId: terminalId, text: t)
+        promptText = ""
+        inputFocused = false
+        Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            await refresh()
         }
     }
 }

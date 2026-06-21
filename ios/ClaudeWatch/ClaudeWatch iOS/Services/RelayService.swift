@@ -268,8 +268,8 @@ final class RelayService: ObservableObject {
 
     /// Send an approval response guarded by the screen hash the user was viewing.
     /// Returns .screenChanged if the bridge rejected because the screen moved.
-    func sendCmuxGuarded(terminalId: String, text: String, expectedScreenHash: String?) async -> CmuxSendResult {
-        await bridgeClient.sendCmuxGuarded(terminalId: terminalId, text: text, expectedScreenHash: expectedScreenHash)
+    func sendCmuxGuarded(terminalId: String, text: String, expectedScreenHash: String?, submit: Bool = true) async -> CmuxSendResult {
+        await bridgeClient.sendCmuxGuarded(terminalId: terminalId, text: text, expectedScreenHash: expectedScreenHash, submit: submit)
     }
 
     /// Start pairing an additional Mac (PairingView is shown over the list).
