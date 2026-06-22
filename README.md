@@ -1,6 +1,10 @@
 <h1 align="center"><strong>Cmux iPhone</strong></h1>
 
 <p align="center">
+  <strong>English</strong> · <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
   Watch and control your <strong>Claude Code</strong>, <strong>Codex</strong>, and <strong>cmux</strong>
   sessions from your iPhone (and Apple Watch).<br/>
   See live terminal output, approve permission prompts, and send prompts — over your LAN or Tailscale.
