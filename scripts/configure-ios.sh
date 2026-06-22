@@ -2,7 +2,7 @@
 # configure-ios.sh — set the iOS/watchOS app's bundle identifier in ONE shot.
 #
 #   ./scripts/configure-ios.sh com.yourname.cmuxiphone
-#   open ios/ClaudeWatch/ClaudeWatch.xcodeproj
+#   open ios/CmuxiPhone/CmuxiPhone.xcodeproj
 #
 # Updates the single CMUX_IPHONE_BUNDLE_ID build setting, from which the iPhone
 # id, the Watch id (<id>.watchkitapp), and the Watch's companion id all derive.
@@ -26,8 +26,8 @@ case "$ID" in
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PBX="$ROOT/ios/ClaudeWatch/ClaudeWatch.xcodeproj/project.pbxproj"
-YML="$ROOT/ios/ClaudeWatch/project.yml"
+PBX="$ROOT/ios/CmuxiPhone/CmuxiPhone.xcodeproj/project.pbxproj"
+YML="$ROOT/ios/CmuxiPhone/project.yml"
 
 [ -f "$PBX" ] || { echo "Error: $PBX not found." >&2; exit 1; }
 
@@ -41,5 +41,5 @@ echo "    iPhone:    $ID"
 echo "    Watch:     ${ID}.watchkitapp"
 echo "    Companion: $ID"
 echo ""
-echo "Next: open ios/ClaudeWatch/ClaudeWatch.xcodeproj, set your Team on both"
+echo "Next: open ios/CmuxiPhone/CmuxiPhone.xcodeproj, set your Team on both"
 echo "targets (Signing & Capabilities), and Run."
