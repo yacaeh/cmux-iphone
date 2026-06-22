@@ -7,7 +7,7 @@
 <p align="center">
   Watch and control your <strong>Claude Code</strong>, <strong>Codex</strong>, and <strong>cmux</strong>
   sessions from your iPhone (and Apple Watch).<br/>
-  See live terminal output, approve permission prompts, and send prompts — over your LAN or Tailscale.
+  See live terminal output and send prompts; approve permission requests on iPhone and monitor them on Apple Watch — over your LAN or Tailscale.
 </p>
 
 https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
@@ -110,7 +110,7 @@ Manage it with the CLI:
 | `cmux-iphone doctor` | read-only diagnostics — **paste this into a GitHub issue** |
 | `cmux-iphone status` | bridge state, LAN/Tailscale address, cmux, paired devices |
 | `cmux-iphone pair` | show the pairing code · `--list` · `--revoke <id>` |
-| `cmux-iphone logs` | tail the bridge log |
+| `cmux-iphone logs` | tail the LaunchAgent log (for an in-cmux bridge, open the **Agent Bridge** workspace) |
 | `cmux-iphone restart` | restart the bridge |
 | `cmux-iphone uninstall` | remove hooks + service (`--purge` also deletes data) |
 
@@ -184,8 +184,13 @@ Enter this code in the Cmux iPhone app on your iPhone.
 
 > **Choose your own code (optional):** set `CMUX_IPHONE_PAIR_CODE=123456` in the
 > bridge's environment to pin a memorable code. The code is the pairing gate
-> (rate-limited, LAN/Tailscale-only, and each device still gets its own token),
-> so keep it private and don't expose the bridge to the public internet.
+> (rate-limited — 5 tries per 5 min — and each device still gets its own token), so
+> keep it private. Trusted LAN or Tailscale use is recommended; do not expose the
+> bridge directly to the public internet.
+
+> **Rotating code (optional):** prefer a code that rotates over a fixed one? Run
+> `cmux-iphone setup --rotating` — a fresh 6-digit code each restart (24h TTL,
+> cleared once a device pairs) instead of the stable per-Mac default.
 
 > **Watch approvals (beta):** the Watch *shows* approvals but you answer them on
 > the iPhone for now.
@@ -197,12 +202,16 @@ Enter this code in the Cmux iPhone app on your iPhone.
 Run **`cmux-iphone doctor`** first — it prints a PASS/WARN/FAIL report (no
 secrets) that's ideal to paste into an issue.
 
-- **iPhone "Connection failed":** `curl http://127.0.0.1:7860/health` (note:
-  `/status` requires auth). Bridge + phone must share the LAN (or Tailscale).
+- **iPhone "Connection failed":** run `cmux-iphone status` to get the bridge's
+  **actual address + port** (it may bind another port in 7860–7869, or a non-loopback
+  interface), then probe `/health` there — e.g. `curl http://<addr>:<port>/health`
+  (note: `/status` requires auth). Bridge + phone must share the LAN (or Tailscale).
 - **No cmux workspaces:** cmux only mirrors when the bridge runs *inside* cmux
   (`cmux-iphone status` shows the runner). Without cmux you still get hook sessions.
-- **Watch can't find the bridge:** same Wi-Fi; turn **off** Private Wi-Fi Address
-  on the watch's network (Bonjour); or enter the IP manually.
+- **Watch/phone can't find the bridge (Bonjour):** check, in order — the app's iOS
+  **Local Network** permission; both devices on the **same network**; the router's
+  **AP / client isolation** is off; **mDNS isn't blocked**; then fall back to entering
+  the **IP manually** (from `cmux-iphone status`).
 - **Permission prompts don't appear:** confirm hooks in `~/.claude/settings.json`
   and that a device is paired (`cmux-iphone pair --list`).
 
@@ -229,16 +238,20 @@ Hooks installed (loopback listener, secret-gated): `PostToolUse`, `PreToolUse`,
 
 ## Security
 
-The bridge listens on `0.0.0.0:<port>` (LAN-reachable). Auth is the pairing code
-+ per-device token; the hook listener is loopback-only and secret-gated. Secrets
-live outside the repo at `0600`. Prefer Tailscale over exposing the LAN port.
-Full model + reporting in [`SECURITY.md`](SECURITY.md).
+By default the bridge listens on `0.0.0.0:<port>` (LAN-reachable); set `bindAddress`
+(or the `HOST` env) to restrict it to a Tailscale/loopback interface. Auth is the
+pairing code + per-device token; the hook listener is loopback-only and secret-gated.
+Secrets live outside the repo at `0600`. Trusted LAN or Tailscale use is recommended —
+do not expose the bridge directly to the public internet. Full model + reporting in
+[`SECURITY.md`](SECURITY.md).
 
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
 
 Cmux iPhone is a fork of [shobhit99/claude-watch](https://github.com/shobhit99/claude-watch)
-(MIT); original-author copyright is preserved. See [`NOTICE.md`](NOTICE.md) for
-attribution and trademark notes ("Claude" and its logo are Anthropic trademarks;
-this is an independent community tool, not affiliated with Anthropic).
+(MIT); original-author copyright is preserved. The app ships **neutral icons** — no
+Claude/Anthropic or OpenAI/Codex logo assets are bundled; "Claude" and "Codex" are
+trademarks of Anthropic and OpenAI respectively, used only as text labels. This is an
+independent community tool, not affiliated with or endorsed by Anthropic or OpenAI.
+See [`NOTICE.md`](NOTICE.md) for full attribution.

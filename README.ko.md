@@ -7,7 +7,7 @@
 <p align="center">
   아이폰(과 Apple Watch)에서 <strong>Claude Code</strong>, <strong>Codex</strong>, <strong>cmux</strong>
   세션을 보고 제어하세요.<br/>
-  실시간 터미널 출력 확인, 권한 프롬프트 승인, 프롬프트 전송 — LAN 또는 Tailscale로.
+  실시간 터미널 출력 확인과 프롬프트 전송, 권한 요청은 아이폰에서 승인(Apple Watch에서는 모니터링) — LAN 또는 Tailscale로.
 </p>
 
 https://github.com/user-attachments/assets/5f478c28-2086-4696-9d76-e43dda853201
@@ -108,7 +108,7 @@ CLI로 관리합니다:
 | `cmux-iphone doctor` | 읽기 전용 진단 — **GitHub 이슈에 붙여넣기 좋음** |
 | `cmux-iphone status` | 브리지 상태, LAN/Tailscale 주소, cmux, 페어링된 기기 |
 | `cmux-iphone pair` | 페어링 코드 표시 · `--list` · `--revoke <id>` |
-| `cmux-iphone logs` | 브리지 로그 tail |
+| `cmux-iphone logs` | LaunchAgent 로그 tail (in-cmux 브리지는 **Agent Bridge** 워크스페이스에서 확인) |
 | `cmux-iphone restart` | 브리지 재시작 |
 | `cmux-iphone uninstall` | 훅 + 서비스 제거 (`--purge`는 데이터까지 삭제) |
 
@@ -155,7 +155,7 @@ watchOS Settings → Privacy & Security.)
 
 ### 페어링
 
-1. 앱을 열고 → **페어링 코드**(아래 참고)와 Mac 주소를 입력
+1. 앱을 열고 → **페어링 코드**(아래 참고)와 **Mac의 IP 주소 또는 Tailscale 주소**를 입력
    (`cmux-iphone status`가 LAN과 Tailscale 주소를 보여줍니다).
 2. 같은 Wi-Fi면 → 브리지가 자동 발견(Bonjour)되므로 주소 입력을 생략할 수 있습니다.
    네트워크가 다르면 **Tailscale 주소**를 써서 사무실이든 외부든 같은 페어링이 동작하게 하세요.
@@ -178,9 +178,12 @@ Enter this code in the Cmux iPhone app on your iPhone.
 ```
 
 > **직접 코드 지정 (선택):** 브리지 환경에 `CMUX_IPHONE_PAIR_CODE=123456`을 설정해 기억하기
-> 쉬운 코드를 고정할 수 있습니다. 코드는 페어링 관문입니다(레이트 리밋, LAN/Tailscale 전용,
-> 각 기기는 여전히 자체 토큰을 받음). 그러니 비공개로 유지하고 브리지를 공개 인터넷에
-> 노출하지 마세요.
+> 쉬운 코드를 고정할 수 있습니다. 코드는 페어링 관문입니다(레이트 리밋 — 5분당 5회, 각 기기는
+> 여전히 자체 토큰을 받음). 비공개로 유지하세요. 신뢰할 수 있는 LAN 또는 Tailscale 사용을
+> 권장하며, 브리지를 공개 인터넷에 직접 노출하지 마세요.
+
+> **회전 코드 (선택):** 고정 코드 대신 회전하는 코드를 원하면 `cmux-iphone setup --rotating`을
+> 실행하세요 — 재시작마다 새 6자리 코드(24h TTL, 기기 페어링 후 비워짐).
 
 > **워치 승인 (베타):** 워치는 승인을 *보여주지만*, 현재는 아이폰에서 응답합니다.
 
@@ -191,12 +194,15 @@ Enter this code in the Cmux iPhone app on your iPhone.
 먼저 **`cmux-iphone doctor`**를 실행하세요 — 시크릿 없는 PASS/WARN/FAIL 리포트를 출력하며
 이슈에 붙여넣기 좋습니다.
 
-- **아이폰 "Connection failed":** `curl http://127.0.0.1:7860/health`(참고: `/status`는 인증
-  필요). 브리지와 폰은 같은 LAN(또는 Tailscale)을 공유해야 합니다.
+- **아이폰 "Connection failed":** `cmux-iphone status`로 브리지의 **실제 주소 + 포트**를
+  확인한 뒤(7860–7869 중 다른 포트이거나 loopback이 아닌 인터페이스일 수 있음) 거기로
+  `/health`를 조회하세요 — 예: `curl http://<주소>:<포트>/health`(참고: `/status`는 인증 필요).
+  브리지와 폰은 같은 LAN(또는 Tailscale)을 공유해야 합니다.
 - **cmux 워크스페이스가 없음:** cmux는 브리지가 cmux *안에서* 실행될 때만 미러링합니다
   (`cmux-iphone status`가 러너를 표시). cmux가 없어도 훅 세션은 계속 동작합니다.
-- **워치가 브리지를 못 찾음:** 같은 Wi-Fi인지 확인하고, 워치 네트워크의 Private Wi-Fi Address를
-  **끄세요**(Bonjour); 또는 IP를 직접 입력.
+- **워치/폰이 브리지를 못 찾음(Bonjour):** 순서대로 점검하세요 — 앱의 iOS **로컬 네트워크**
+  권한, 두 기기가 **같은 네트워크**인지, 공유기의 **AP/클라이언트 격리(isolation)** 해제,
+  **mDNS 차단** 여부, 그래도 안 되면 **IP 직접 입력**(`cmux-iphone status`).
 - **권한 프롬프트가 안 뜸:** `~/.claude/settings.json`의 훅과 기기가 페어링됐는지 확인
   (`cmux-iphone pair --list`).
 
@@ -222,16 +228,18 @@ Claude가 권한 프롬프트에 도달 → `PermissionRequest` 훅이 **블록*
 
 ## 보안
 
-브리지는 `0.0.0.0:<port>`(LAN 도달 가능)에서 수신합니다. 인증은 페어링 코드 + 기기별 토큰이며,
-훅 리스너는 루프백 전용에 시크릿 게이트가 걸립니다. 시크릿은 저장소 밖에 `0600`으로 보관됩니다.
-LAN 포트를 노출하기보다 Tailscale을 선호하세요. 전체 모델 + 신고 방법은
-[`SECURITY.md`](SECURITY.md)에 있습니다.
+브리지는 **기본적으로** `0.0.0.0:<port>`(LAN 도달 가능)에서 수신합니다. `bindAddress`(또는 `HOST`
+환경 변수)로 Tailscale/loopback 인터페이스로 제한할 수 있습니다. 인증은 페어링 코드 + 기기별
+토큰이며, 훅 리스너는 루프백 전용에 시크릿 게이트가 걸립니다. 시크릿은 저장소 밖에 `0600`으로
+보관됩니다. 신뢰할 수 있는 LAN 또는 Tailscale 사용을 권장하며, 브리지를 공개 인터넷에 직접
+노출하지 마세요. 전체 모델 + 신고 방법은 [`SECURITY.md`](SECURITY.md)에 있습니다.
 
 ## 라이선스
 
 MIT — [`LICENSE`](LICENSE) 참고.
 
 Cmux iPhone은 [shobhit99/claude-watch](https://github.com/shobhit99/claude-watch)(MIT)의
-포크이며 원저작자 저작권을 보존합니다. 출처 및 상표 안내는 [`NOTICE.md`](NOTICE.md) 참고
-("Claude"와 그 로고는 Anthropic의 상표이며, 본 프로젝트는 Anthropic과 무관한 독립 커뮤니티
-도구입니다).
+포크이며 원저작자 저작권을 보존합니다. 앱은 **중립 아이콘**을 사용합니다 — Claude/Anthropic이나
+OpenAI/Codex 로고 에셋은 포함되지 않으며, "Claude"와 "Codex"는 각각 Anthropic과 OpenAI의
+상표로 텍스트 라벨로만 쓰입니다. 본 프로젝트는 Anthropic이나 OpenAI와 무관한 독립 커뮤니티
+도구입니다. 전체 출처는 [`NOTICE.md`](NOTICE.md) 참고.
