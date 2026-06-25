@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import PhotosUI
 
 // MARK: - Navigation routes
 //
@@ -671,6 +672,12 @@ private struct CmuxTerminalView: View {
     @State private var promptText: String = ""
     @State private var sending = false
     @State private var browseTarget: BrowseTarget? = nil
+    @State private var photoItem: PhotosPickerItem? = nil
+    @State private var showPhotoPicker = false
+    @State private var showCamera = false
+    @State private var showImageSource = false
+    @State private var uploadingImage = false
+    @State private var uploadError: String? = nil
     @State private var showModelSheet = false
     @State private var codexDriving = false
     @State private var codexStatus = ""
@@ -981,6 +988,15 @@ private struct CmuxTerminalView: View {
 
     private var inputBar: some View {
         HStack(spacing: 8) {
+            // Attach a photo/screenshot → uploads to cwd, inserts the path.
+            Button { showImageSource = true } label: {
+                Image(systemName: uploadingImage ? "ellipsis" : "photo")
+                    .font(.system(size: 18))
+                    .foregroundStyle(uploadingImage ? Color.subtleText : Color.claudeOrange)
+                    .frame(width: 38, height: 38)
+            }
+            .disabled(uploadingImage)
+
             TextField("프롬프트 입력…", text: $promptText, axis: .vertical)
                 .font(.system(size: 14, design: .monospaced))
                 .foregroundStyle(Color.textPrimary)
@@ -1004,6 +1020,64 @@ private struct CmuxTerminalView: View {
             }
             .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending)
         }
+        .confirmationDialog("이미지 첨부", isPresented: $showImageSource, titleVisibility: .visible) {
+            Button("사진 보관함") { showPhotoPicker = true }
+            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                Button("카메라 촬영") { showCamera = true }
+            }
+            Button("취소", role: .cancel) {}
+        }
+        .photosPicker(isPresented: $showPhotoPicker, selection: $photoItem, matching: .images)
+        .fullScreenCover(isPresented: $showCamera) {
+            CameraPicker { img in uploadImage(img) }.ignoresSafeArea()
+        }
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self),
+                   let img = UIImage(data: data) {
+                    uploadImage(img)
+                }
+                photoItem = nil
+            }
+        }
+        .alert("업로드 오류", isPresented: Binding(
+            get: { uploadError != nil },
+            set: { if !$0 { uploadError = nil } }
+        )) {
+            Button("확인", role: .cancel) {}
+        } message: { Text(uploadError ?? "") }
+    }
+
+    // Compress + downscale an image and upload it; on success insert the saved
+    // path into the prompt so the user can add context and send it to the agent.
+    private func uploadImage(_ image: UIImage) {
+        guard !uploadingImage, let data = Self.jpegForUpload(image) else { return }
+        uploadingImage = true
+        Task {
+            let result = await relayService.cmuxUpload(terminalId, data: data, ext: "jpg")
+            uploadingImage = false
+            switch result {
+            case .ok(_, let rel):
+                let prefix = promptText.isEmpty ? "" : promptText + " "
+                promptText = prefix + rel + " "
+                inputFocused = true
+            case .failed(let msg):
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                uploadError = msg
+            }
+        }
+    }
+
+    // JPEG-encode (downscaled to <= maxDimension) to keep uploads small + readable.
+    private static func jpegForUpload(_ image: UIImage, maxDimension: CGFloat = 2048) -> Data? {
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        let factor = min(1, maxDimension / max(size.width, size.height))
+        let target = CGSize(width: size.width * factor, height: size.height * factor)
+        let renderer = UIGraphicsImageRenderer(size: target)
+        let resized = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: target)) }
+        return resized.jpegData(compressionQuality: 0.85)
     }
 
     // Send the prompt to the terminal (the screen is expected to keep changing).
@@ -1218,6 +1292,32 @@ private struct ZoomableImage: View {
             }
             .background(Color.appBackground)
             .clipped()
+    }
+}
+
+/// Camera capture via UIImagePickerController (SwiftUI has no native camera).
+private struct CameraPicker: UIViewControllerRepresentable {
+    let onImage: (UIImage) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let parent: CameraPicker
+        init(_ parent: CameraPicker) { self.parent = parent }
+        func imagePickerController(_ picker: UIImagePickerController,
+                                   didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            if let img = info[.originalImage] as? UIImage { parent.onImage(img) }
+            parent.dismiss()
+        }
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) { parent.dismiss() }
     }
 }
 

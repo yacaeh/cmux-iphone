@@ -72,6 +72,12 @@ enum CmuxNodeResult {
     case failed(String)
 }
 
+/// Result of uploading an image into a terminal's cwd.
+enum CmuxUploadResult {
+    case ok(path: String, relPath: String)
+    case failed(String)
+}
+
 /// Result of a guarded cmux input send.
 enum CmuxSendResult {
     case sent
@@ -349,6 +355,40 @@ final class BridgeClient {
             ))
         } catch {
             return .failed("불러오지 못했습니다")
+        }
+    }
+
+    /// Upload an image (photo/screenshot) into the terminal's cwd. Returns the
+    /// saved path so the caller can hand it to the agent.
+    func uploadCmuxImage(terminalId: String, data: Data, ext: String) async -> CmuxUploadResult {
+        guard let baseURL, let token else { return .failed("브리지에 연결되어 있지 않습니다") }
+        var comps = URLComponents(url: baseURL.appendingPathComponent("cmux/upload"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: terminalId),
+            URLQueryItem(name: "ext", value: ext),
+        ]
+        guard let url = comps?.url else { return .failed("경로가 올바르지 않습니다") }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("image/\(ext)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        do {
+            let (respData, response) = try await performRequest(request)
+            let json = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any]
+            guard let http = response as? HTTPURLResponse else { return .failed("응답이 없습니다") }
+            if (200..<300).contains(http.statusCode) {
+                let path = json?["path"] as? String ?? ""
+                let rel = json?["relPath"] as? String ?? path
+                return .ok(path: path, relPath: rel)
+            }
+            switch json?["error"] as? String {
+            case "too-large": return .failed("이미지가 너무 큽니다")
+            case "terminal-cwd-unavailable": return .failed("터미널 작업 폴더를 확인할 수 없습니다")
+            default: return .failed("업로드 실패 (\(http.statusCode))")
+            }
+        } catch {
+            return .failed("업로드하지 못했습니다")
         }
     }
 

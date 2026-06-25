@@ -278,6 +278,11 @@ final class RelayService: ObservableObject {
         await bridgeClient.fetchCmuxFile(terminalId: terminalId, path: path)
     }
 
+    /// Upload an image into a terminal's cwd; returns the saved path.
+    func cmuxUpload(_ terminalId: String, data: Data, ext: String) async -> CmuxUploadResult {
+        await bridgeClient.uploadCmuxImage(terminalId: terminalId, data: data, ext: ext)
+    }
+
     /// Send a prompt straight to a cmux terminal (types + Enter). Unguarded —
     /// for normal prompts where the screen is expected to keep changing.
     func sendCmux(terminalId: String, text: String) {

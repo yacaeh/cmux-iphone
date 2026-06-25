@@ -292,6 +292,22 @@ function readBody(req) {
   });
 }
 
+// Collect a raw (binary) request body up to maxBytes. Used for image uploads,
+// which would otherwise hit readBody's 4 MB JSON cap and aren't JSON anyway.
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > maxBytes) { reject(new Error("too-large")); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
 function availableAgentsList() {
   const agents = [];
   if (CLAUDE_BIN) agents.push("claude");
@@ -2076,6 +2092,43 @@ async function handleCmuxFile(req, res) {
   }
 }
 
+// POST /cmux/upload?id=<terminalId>&ext=<png|jpg|…> — save an image sent from the
+// phone (photo/screenshot) into the terminal's cwd under .cmux-uploads/, so the
+// agent running there can read it. Raw image bytes in the body. Returns the
+// saved path (absolute + cwd-relative). Writes only inside cwd, generated name.
+const CMUX_UPLOAD_MAX = 16 * 1024 * 1024; // 16 MB
+const CMUX_UPLOAD_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic"]);
+async function handleCmuxUpload(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  const id = url.searchParams.get("id");
+  if (!id) return jsonResponse(res, 400, { error: "Missing id" });
+  let ext = (url.searchParams.get("ext") || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!CMUX_UPLOAD_EXT.has(ext)) ext = "jpg";
+
+  const cwd = await cmux.terminalCwd(id);
+  if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
+
+  let bytes;
+  try { bytes = await readRawBody(req, CMUX_UPLOAD_MAX); }
+  catch { return jsonResponse(res, 413, { error: "too-large" }); }
+  if (!bytes || !bytes.length) return jsonResponse(res, 400, { error: "empty" });
+
+  try {
+    const base = path.resolve(cwd);
+    const dir = path.join(base, ".cmux-uploads");
+    await fs.promises.mkdir(dir, { recursive: true });
+    const rand = crypto.randomBytes(3).toString("hex");
+    const name = `iphone-${Date.now()}-${rand}.${ext}`;
+    const full = path.join(dir, name);
+    await fs.promises.writeFile(full, bytes);
+    return jsonResponse(res, 200, { path: full, relPath: path.join(".cmux-uploads", name), name });
+  } catch {
+    return jsonResponse(res, 500, { error: "write-failed" });
+  }
+}
+
 // --- cmux events -> SSE (live mirror updates) ------------------------------
 let cmuxEventChild = null;
 let cmuxRespawnTimer = null;
@@ -2137,6 +2190,7 @@ const routes = {
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,
   "GET /cmux/file": handleCmuxFile,
+  "POST /cmux/upload": handleCmuxUpload,
 };
 
 function isLocalRequest(req) {
