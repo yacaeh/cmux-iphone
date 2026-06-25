@@ -17,7 +17,7 @@ settings:
     # derive from this — change it in one place (or run scripts/configure-ios.sh).
     # DEVELOPMENT_TEAM is intentionally NOT set here so no personal signing
     # identity is committed — set yours in Xcode (it stays a local change).
-    CMUX_IPHONE_BUNDLE_ID: com.limseungwon.cmuxiphone
+    CMUX_IPHONE_BUNDLE_ID: com.fourbro.cmuxiphone
 
 targets:
   CmuxiPhone:
