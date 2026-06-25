@@ -283,6 +283,16 @@ final class RelayService: ObservableObject {
         await bridgeClient.uploadCmuxImage(terminalId: terminalId, data: data, ext: ext)
     }
 
+    /// Per-terminal run state ("running"/"idle"), derived from each terminal's
+    /// live screen. Used by the dashboard + project/session badges.
+    @Published private(set) var terminalStatuses: [String: String] = [:]
+    var runningTerminalIds: Set<String> {
+        Set(terminalStatuses.filter { $0.value == "running" }.map(\.key))
+    }
+    func refreshCmuxStatuses() async {
+        if let m = await bridgeClient.fetchCmuxStatuses() { terminalStatuses = m }
+    }
+
     /// Send a prompt straight to a cmux terminal (types + Enter). Unguarded —
     /// for normal prompts where the screen is expected to keep changing.
     func sendCmux(terminalId: String, text: String) {

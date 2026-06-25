@@ -358,6 +358,23 @@ final class BridgeClient {
         }
     }
 
+    /// Per-terminal run state ("running"/"idle"), derived server-side from the
+    /// live screen. Returns nil on failure.
+    func fetchCmuxStatuses() async -> [String: String]? {
+        guard let baseURL, let token else { return nil }
+        let url = baseURL.appendingPathComponent("cmux/statuses")
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await performRequest(request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            return json?["statuses"] as? [String: String]
+        } catch {
+            return nil
+        }
+    }
+
     /// Upload an image (photo/screenshot) into the terminal's cwd. Returns the
     /// saved path so the caller can hand it to the agent.
     func uploadCmuxImage(terminalId: String, data: Data, ext: String) async -> CmuxUploadResult {

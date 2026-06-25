@@ -2129,6 +2129,40 @@ async function handleCmuxUpload(req, res) {
   }
 }
 
+// GET /cmux/statuses — per-terminal run state for the dashboard. The cmux tree
+// only exposes is_ready (always true), so "running" is detected from the live
+// VISIBLE screen: vanilla Claude/Codex show "esc to interrupt" while generating;
+// the OMC statusline shows "| thinking". Reads are bounded-concurrent.
+function classifyTerminalState(text) {
+  const t = (text || "").toLowerCase();
+  if (t.includes("esc to interrupt")) return "running";
+  if (/\|\s*thinking\b/.test(t) || /\bthinking\s*[…|]/.test(t)) return "running";
+  return "idle";
+}
+
+async function handleCmuxStatuses(req, res) {
+  if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+
+  const tree = await cmux.mobileWorkspaces();
+  const ids = [];
+  for (const w of (tree?.workspaces || [])) {
+    for (const t of (w.terminals || [])) ids.push(t.id);
+  }
+  const statuses = {};
+  let idx = 0;
+  const worker = async () => {
+    while (idx < ids.length) {
+      const id = ids[idx++];
+      try { statuses[id] = classifyTerminalState(await cmux.readVisibleText(id)); }
+      catch { statuses[id] = "idle"; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, ids.length) }, worker));
+  return jsonResponse(res, 200, { statuses });
+}
+
 // --- cmux events -> SSE (live mirror updates) ------------------------------
 let cmuxEventChild = null;
 let cmuxRespawnTimer = null;
@@ -2190,6 +2224,7 @@ const routes = {
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,
   "GET /cmux/file": handleCmuxFile,
+  "GET /cmux/statuses": handleCmuxStatuses,
   "POST /cmux/upload": handleCmuxUpload,
 };
 

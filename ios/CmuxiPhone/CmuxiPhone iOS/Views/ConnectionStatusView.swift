@@ -429,11 +429,12 @@ private struct WorkspacesView: View {
             }
             .padding(16)
         }
+        .task { await relayService.refreshCmuxStatuses() }
     }
 
     private func cmuxWorkspaceRow(_ ws: CmuxWorkspace) -> some View {
         let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
-        let status = dashWorkspaceStatus(ws, waiting: waiting)
+        let status = dashWorkspaceStatus(ws, waiting: waiting, running: relayService.runningTerminalIds)
         return HStack(spacing: 12) {
             Image(systemName: "rectangle.3.group")
                 .font(.system(size: 18))
@@ -614,19 +615,18 @@ private enum DashStatus: Int {
     }
 }
 
-// Running ⇔ the title leads with a braille spinner glyph (cmux shows one while
-// the agent is working); ✳ and other markers count as idle.
-private func dashIsRunning(_ title: String) -> Bool {
-    guard let first = title.unicodeScalars.first(where: { !CharacterSet.whitespaces.contains($0) }) else { return false }
-    return (0x2800...0x28FF).contains(first.value)
+// Status priority: a pending approval > actively running (detected server-side
+// from the live screen — "esc to interrupt" / OMC "thinking") > idle. The old
+// title-glyph guess was unreliable (idle and working both show ✳), so running
+// now comes from relayService.runningTerminalIds.
+private func dashTerminalStatus(_ t: CmuxTerminal, waiting: Set<String>, running: Set<String>) -> DashStatus {
+    if waiting.contains(t.id) { return .approval }
+    if running.contains(t.id) { return .running }
+    return .idle
 }
 
-private func dashTerminalStatus(_ t: CmuxTerminal, waiting: Set<String>) -> DashStatus {
-    waiting.contains(t.id) ? .approval : (dashIsRunning(t.title) ? .running : .idle)
-}
-
-private func dashWorkspaceStatus(_ ws: CmuxWorkspace, waiting: Set<String>) -> DashStatus {
-    let statuses = ws.terminals.map { dashTerminalStatus($0, waiting: waiting) }
+private func dashWorkspaceStatus(_ ws: CmuxWorkspace, waiting: Set<String>, running: Set<String>) -> DashStatus {
+    let statuses = ws.terminals.map { dashTerminalStatus($0, waiting: waiting, running: running) }
     if statuses.contains(.approval) { return .approval }
     if statuses.contains(.running) { return .running }
     return .idle
@@ -695,6 +695,7 @@ private struct DirThumb: View {
 private struct SessionDashboardView: View {
     @EnvironmentObject private var relayService: RelayService
     @State private var attentionOnly = false
+    private let statusTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
 
     private struct Row: Identifiable {
         let id: String
@@ -705,21 +706,23 @@ private struct SessionDashboardView: View {
 
     private var rows: [Row] {
         let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
+        let running = relayService.runningTerminalIds
         var out: [Row] = []
         for ws in relayService.cmuxWorkspaces {
             for t in ws.terminals {
                 out.append(Row(id: t.id, title: t.title, workspace: ws.title,
-                               status: dashTerminalStatus(t, waiting: waiting)))
+                               status: dashTerminalStatus(t, waiting: waiting, running: running)))
             }
         }
         out.sort { $0.status.rawValue != $1.status.rawValue ? $0.status.rawValue < $1.status.rawValue : $0.title < $1.title }
-        return attentionOnly ? out.filter { $0.status == .approval } : out
+        return attentionOnly ? out.filter { $0.status != .idle } : out
     }
 
     private func count(_ s: DashStatus) -> Int {
         let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
+        let running = relayService.runningTerminalIds
         return relayService.cmuxWorkspaces.flatMap(\.terminals).filter {
-            dashTerminalStatus($0, waiting: waiting) == s
+            dashTerminalStatus($0, waiting: waiting, running: running) == s
         }.count
     }
 
@@ -775,6 +778,8 @@ private struct SessionDashboardView: View {
         }
         .navigationTitle("세션 대시보드")
         .navigationBarTitleDisplayMode(.inline)
+        .task { await relayService.refreshCmuxStatuses() }
+        .onReceive(statusTimer) { _ in Task { await relayService.refreshCmuxStatuses() } }
     }
 
     private func summaryChip(_ status: DashStatus, _ n: Int) -> some View {
@@ -831,11 +836,12 @@ private struct CmuxTerminalsView: View {
         .navigationTitle(workspace?.title ?? "Workspace")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { relayService.refreshCmuxTree() }
+        .task { await relayService.refreshCmuxStatuses() }
     }
 
     private func terminalRow(_ t: CmuxTerminal) -> some View {
         let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
-        let status = dashTerminalStatus(t, waiting: waiting)
+        let status = dashTerminalStatus(t, waiting: waiting, running: relayService.runningTerminalIds)
         return HStack(spacing: 12) {
             Image(systemName: "terminal")
                 .font(.system(size: 15))
