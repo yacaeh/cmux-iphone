@@ -430,6 +430,15 @@ const KEY_SEQUENCES = {
   escape: "\x1b",
   tab: "\t",
   backspace: "\x7f",
+  // control keys — "ctrl-c" interrupts a running agent/command (cancel).
+  "ctrl-c": "\x03",
+  "ctrl-d": "\x04",
+  "ctrl-z": "\x1a",
+  "ctrl-l": "\x0c",
+  "ctrl-r": "\x12",
+  "ctrl-u": "\x15",
+  "ctrl-a": "\x01",
+  "ctrl-e": "\x05",
 };
 
 export function isNamedKey(key) {

@@ -432,7 +432,9 @@ private struct WorkspacesView: View {
     }
 
     private func cmuxWorkspaceRow(_ ws: CmuxWorkspace) -> some View {
-        HStack(spacing: 12) {
+        let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
+        let status = dashWorkspaceStatus(ws, waiting: waiting)
+        return HStack(spacing: 12) {
             Image(systemName: "rectangle.3.group")
                 .font(.system(size: 18))
                 .foregroundStyle(Color.claudeOrange.opacity(0.9))
@@ -456,6 +458,9 @@ private struct WorkspacesView: View {
             }
 
             Spacer()
+            if status != .idle {
+                DashStatusBadge(status: status, showLabel: status == .approval)
+            }
             if ws.hasUnread {
                 Circle().fill(Color.claudeAmber).frame(width: 8, height: 8)
             } else if ws.selected {
@@ -609,6 +614,82 @@ private enum DashStatus: Int {
     }
 }
 
+// Running ⇔ the title leads with a braille spinner glyph (cmux shows one while
+// the agent is working); ✳ and other markers count as idle.
+private func dashIsRunning(_ title: String) -> Bool {
+    guard let first = title.unicodeScalars.first(where: { !CharacterSet.whitespaces.contains($0) }) else { return false }
+    return (0x2800...0x28FF).contains(first.value)
+}
+
+private func dashTerminalStatus(_ t: CmuxTerminal, waiting: Set<String>) -> DashStatus {
+    waiting.contains(t.id) ? .approval : (dashIsRunning(t.title) ? .running : .idle)
+}
+
+private func dashWorkspaceStatus(_ ws: CmuxWorkspace, waiting: Set<String>) -> DashStatus {
+    let statuses = ws.terminals.map { dashTerminalStatus($0, waiting: waiting) }
+    if statuses.contains(.approval) { return .approval }
+    if statuses.contains(.running) { return .running }
+    return .idle
+}
+
+/// Small status pill (colored dot + label) reused across dashboard, project, and
+/// session views.
+private struct DashStatusBadge: View {
+    let status: DashStatus
+    var showLabel = true
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(status.color).frame(width: 8, height: 8)
+            if showLabel {
+                Text(status.label)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(status.color)
+            }
+        }
+    }
+}
+
+private func isImageName(_ name: String) -> Bool {
+    let ext = (name as NSString).pathExtension.lowercased()
+    return ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "tiff", "tif", "ico"].contains(ext)
+}
+
+/// Inline thumbnail for an image entry in a directory listing — fetches the image
+/// lazily (only visible rows load) and shows a small preview right in the list.
+private struct DirThumb: View {
+    let terminalId: String
+    let path: String
+    @EnvironmentObject private var relayService: RelayService
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                Image(systemName: failed ? "photo" : "photo")
+                    .foregroundStyle(Color.subtleText)
+                    .opacity(image == nil ? 0.5 : 1)
+            }
+        }
+        .frame(width: 40, height: 40)
+        .background(Color.surfaceElevated)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .task { await load() }
+    }
+
+    private func load() async {
+        guard image == nil, !failed else { return }
+        if case .ok(let node) = await relayService.cmuxFile(terminalId, path: path),
+           node.kind == .image, let data = node.imageData, let ui = UIImage(data: data) {
+            image = ui
+        } else {
+            failed = true
+        }
+    }
+}
+
 /// Flat, cross-workspace view of every terminal with a status badge, so the user
 /// can spot what needs attention. "주목 필요만" filters to terminals awaiting approval.
 private struct SessionDashboardView: View {
@@ -622,21 +703,13 @@ private struct SessionDashboardView: View {
         let status: DashStatus
     }
 
-    // Running ⇔ the title leads with a braille spinner glyph (cmux shows one while
-    // the agent is working); ✳ and other markers count as idle.
-    private func isRunning(_ title: String) -> Bool {
-        guard let first = title.unicodeScalars.first(where: { !CharacterSet.whitespaces.contains($0) }) else { return false }
-        return (0x2800...0x28FF).contains(first.value)
-    }
-
     private var rows: [Row] {
         let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
         var out: [Row] = []
         for ws in relayService.cmuxWorkspaces {
             for t in ws.terminals {
-                let status: DashStatus = waiting.contains(t.id) ? .approval
-                    : (isRunning(t.title) ? .running : .idle)
-                out.append(Row(id: t.id, title: t.title, workspace: ws.title, status: status))
+                out.append(Row(id: t.id, title: t.title, workspace: ws.title,
+                               status: dashTerminalStatus(t, waiting: waiting)))
             }
         }
         out.sort { $0.status.rawValue != $1.status.rawValue ? $0.status.rawValue < $1.status.rawValue : $0.title < $1.title }
@@ -646,7 +719,7 @@ private struct SessionDashboardView: View {
     private func count(_ s: DashStatus) -> Int {
         let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
         return relayService.cmuxWorkspaces.flatMap(\.terminals).filter {
-            (waiting.contains($0.id) ? DashStatus.approval : (isRunning($0.title) ? .running : .idle)) == s
+            dashTerminalStatus($0, waiting: waiting) == s
         }.count
     }
 
@@ -761,7 +834,9 @@ private struct CmuxTerminalsView: View {
     }
 
     private func terminalRow(_ t: CmuxTerminal) -> some View {
-        HStack(spacing: 12) {
+        let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
+        let status = dashTerminalStatus(t, waiting: waiting)
+        return HStack(spacing: 12) {
             Image(systemName: "terminal")
                 .font(.system(size: 15))
                 .foregroundStyle(t.focused ? Color.claudeOrange : Color.subtleText)
@@ -784,7 +859,7 @@ private struct CmuxTerminalsView: View {
             }
 
             Spacer()
-            if t.focused { Circle().fill(Color.statusGreen).frame(width: 7, height: 7) }
+            DashStatusBadge(status: status, showLabel: status != .idle)
             Image(systemName: "chevron.right")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Color.subtleText.opacity(0.6))
@@ -829,6 +904,7 @@ private struct CmuxTerminalView: View {
                 terminalCard
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
+                specialKeyBar
                 inputBar
                     .padding(.horizontal, 12)
                     .padding(.bottom, 12)
@@ -1124,6 +1200,47 @@ private struct CmuxTerminalView: View {
         }
     }
 
+    // Quick special-key bar — interrupt a running agent (취소 = Ctrl-C), Esc, Tab,
+    // arrows, Enter. Sends raw key sequences straight to the terminal.
+    private var specialKeyBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                keyButton("취소 ⌃C", key: "ctrl-c", prominent: true)
+                keyButton("Esc", key: "escape")
+                keyButton("Tab", key: "tab")
+                keyButton("↑", key: "up")
+                keyButton("↓", key: "down")
+                keyButton("←", key: "left")
+                keyButton("→", key: "right")
+                keyButton("⏎", key: "enter")
+            }
+            .padding(.horizontal, 12)
+        }
+    }
+
+    private func keyButton(_ label: String, key: String, prominent: Bool = false) -> some View {
+        Button { sendKey(key) } label: {
+            Text(label)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(prominent ? .white : Color.textPrimary)
+                .frame(minWidth: 30)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(prominent ? Color.denyRed : Color.surfaceElevated)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.hairline, lineWidth: 1))
+        }
+    }
+
+    private func sendKey(_ key: String) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        Task {
+            await relayService.sendCmuxKey(terminalId: terminalId, key: key)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            await refresh()
+        }
+    }
+
     private var inputBar: some View {
         HStack(spacing: 8) {
             // Attach a photo/screenshot → uploads to cwd, inserts the path.
@@ -1316,13 +1433,20 @@ private struct CmuxNodeScreen: View {
             }
             ForEach(node.entries) { entry in
                 NavigationLink(value: entry.path) {
-                    Label {
-                        Text(entry.name).foregroundStyle(Color.textPrimary)
-                    } icon: {
-                        Image(systemName: entry.isDir ? "folder.fill" : "doc.text")
-                            .foregroundStyle(entry.isDir ? Color.claudeAmber : Color.subtleText)
+                    HStack(spacing: 10) {
+                        if !entry.isDir && isImageName(entry.name) {
+                            DirThumb(terminalId: terminalId, path: entry.path)
+                        } else {
+                            Image(systemName: entry.isDir ? "folder.fill" : "doc.text")
+                                .foregroundStyle(entry.isDir ? Color.claudeAmber : Color.subtleText)
+                                .frame(width: 28)
+                        }
+                        Text(entry.name)
+                            .font(.system(size: 14, design: entry.isDir ? .default : .monospaced))
+                            .foregroundStyle(Color.textPrimary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
                     }
-                    .font(.system(size: 14, design: entry.isDir ? .default : .monospaced))
                 }
             }
             if node.truncated {
