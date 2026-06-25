@@ -2133,13 +2133,18 @@ async function handleCmuxUpload(req, res) {
 // only exposes is_ready (always true), so "running" is detected from the live
 // VISIBLE screen: vanilla Claude/Codex show "esc to interrupt" while generating;
 // the OMC statusline shows "| thinking". Reads are bounded-concurrent.
+// Three states from the live screen:
+//   running  — actively generating ("esc to interrupt" / "esc to cancel")
+//   waiting  — an agent session (Claude/Codex UI present) sitting at its prompt,
+//              i.e. waiting for the user's next input (NOT generating)
+//   idle     — a plain shell / tmux / finished command (no agent UI)
 function classifyTerminalState(text) {
   const t = (text || "").toLowerCase();
-  // "esc to interrupt" (Claude Code / Codex) is the ONLY reliable "actively
-  // generating" marker. The OMC statusline "| thinking" is a reasoning-MODE
-  // label shown even on idle sessions, so it must NOT count as running.
-  if (t.includes("esc to interrupt")) return "running";
-  if (t.includes("esc to cancel")) return "running";
+  if (t.includes("esc to interrupt") || t.includes("esc to cancel")) return "running";
+  const agentUI = ["shift+tab to cycle", "bypass permissions", "? for shortcuts",
+                   "for shortcuts", "← for agents", "⏎ send"]
+    .some((m) => t.includes(m));
+  if (agentUI) return "waiting";
   return "idle";
 }
 
