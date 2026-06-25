@@ -214,6 +214,23 @@ async function rpc(method, params) {
   return stdout && stdout.trim() ? JSON.parse(stdout) : null;
 }
 
+// Working directory of one terminal (its cwd), used to scope file reads from
+// the phone. Falls back to the owning workspace's directory. Returns null if the
+// terminal can't be found.
+export async function terminalCwd(id) {
+  if (!CMUX_BIN || !id) return null;
+  try {
+    const r = await rpc("mobile.workspace.list");
+    const wss = (r && r.workspaces) || [];
+    for (const w of wss) {
+      for (const t of w.terminals || []) {
+        if (t.id === id) return t.current_directory || w.current_directory || null;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 // Full workspace → terminal tree for the mobile mirror.
 // Returns the raw mobile.workspace.list payload (workspaces[].terminals[]).
 export async function mobileWorkspaces() {
@@ -253,6 +270,46 @@ function spansToLines(spans) {
   return lines;
 }
 
+// Like spansToLines, but preserves per-span STYLE (style_id) and positions text
+// using CELL columns (cmux's `column` + `cell_width`) instead of JS string
+// length. CJK glyphs occupy 2 cells but length 1, so the old length-based
+// padding drifted on Korean/CJK text — this keeps the grid aligned. Each line is
+// an array of runs: { t: text, s: style_id }. Gap padding uses style 0.
+function spansToStyledLines(spans) {
+  const byRow = new Map();
+  let maxRow = -1;
+  for (const s of spans || []) {
+    if (typeof s.row !== "number") continue;
+    if (!byRow.has(s.row)) byRow.set(s.row, []);
+    byRow.get(s.row).push(s);
+    if (s.row > maxRow) maxRow = s.row;
+  }
+  const lines = [];
+  for (let r = 0; r <= maxRow; r++) {
+    const rs = byRow.get(r);
+    if (!rs) { lines.push([]); continue; }
+    rs.sort((a, b) => (a.column || 0) - (b.column || 0));
+    const runs = [];
+    let cell = 0; // current position in CELL units
+    for (const s of rs) {
+      const col = s.column || 0;
+      if (col > cell) { runs.push({ t: " ".repeat(col - cell), s: 0 }); cell = col; }
+      const text = s.text || "";
+      if (text) runs.push({ t: text, s: typeof s.style_id === "number" ? s.style_id : 0 });
+      // advance by the span's cell width (CJK-aware), not the string length
+      cell += typeof s.cell_width === "number" ? s.cell_width : text.length;
+    }
+    // drop a trailing whitespace-only run (mirrors plain-text trailing trim)
+    while (runs.length && runs[runs.length - 1].t.trim() === "") runs.pop();
+    lines.push(runs);
+  }
+  return lines;
+}
+
+function styledLineIsEmpty(line) {
+  return !line.some((run) => run.t.trim() !== "");
+}
+
 // VISIBLE rows only (current viewport) — no scrollback. Used to detect a live
 // codex approval prompt without matching stale commands in shell history.
 export async function readVisibleText(id) {
@@ -278,6 +335,58 @@ export async function readTerminalText(id) {
     const lines = spansToLines(rg.scrollback_spans).concat(spansToLines(rg.row_spans));
     const text = lines.join("\n").replace(/^\n+/, "").replace(/\n{3,}/g, "\n\n");
     return text.split("\n").slice(-400).join("\n");
+  } catch {
+    return null;
+  }
+}
+
+// Styled screen of one terminal: same content as readTerminalText, but carries
+// the cmux color palette + per-run style so the phone can render real terminal
+// colors (instead of one flat color) and keep CJK columns aligned. Returns
+// { cols, bg, fg, palette, lines } or null. `palette` maps style_id -> color/
+// attributes; `lines` is an array of rows, each a list of { t, s } runs.
+export async function readTerminalStyled(id) {
+  if (!CMUX_BIN || !id) return null;
+  try {
+    const r = await rpc("mobile.terminal.replay", { terminal_id: id });
+    const rg = r && r.render_grid;
+    if (!rg) return null;
+    const styles = Array.isArray(rg.styles) ? rg.styles : [];
+    const palette = styles.map((p) => ({
+      fg: p.foreground || null,
+      bg: p.background || null,
+      bold: !!p.bold,
+      italic: !!p.italic,
+      underline: !!p.underline,
+      faint: !!p.faint,
+      inverse: !!p.inverse,
+      strike: !!p.strikethrough,
+    }));
+    let lines = spansToStyledLines(rg.scrollback_spans).concat(
+      spansToStyledLines(rg.row_spans)
+    );
+    // trim leading blank lines, collapse 3+ blanks to 2 (mirrors readTerminalText)
+    while (lines.length && styledLineIsEmpty(lines[0])) lines.shift();
+    const collapsed = [];
+    let blanks = 0;
+    for (const ln of lines) {
+      if (styledLineIsEmpty(ln)) {
+        blanks++;
+        if (blanks <= 2) collapsed.push([]);
+      } else {
+        blanks = 0;
+        collapsed.push(ln);
+      }
+    }
+    lines = collapsed.slice(-400);
+    const def = styles[0] || {};
+    return {
+      cols: rg.columns || 0,
+      bg: def.background || "#1E1E1E",
+      fg: def.foreground || "#FFFFFF",
+      palette,
+      lines,
+    };
   } catch {
     return null;
   }

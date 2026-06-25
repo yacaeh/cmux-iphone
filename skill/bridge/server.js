@@ -1922,8 +1922,158 @@ async function handleCmuxScreen(req, res) {
   const text = await cmux.readTerminalText(id);
   // Include the screen hash so the phone can echo it back as expectedScreenHash
   // when answering an approval (the bridge rejects if the screen changed since).
+  // hash MUST stay derived from the plain text — it must equal cmux.screenHash(id)
+  // for the approval echo-back verification to work; do not fold `styled` into it.
   const hash = text == null ? null : crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
-  return jsonResponse(res, 200, { id, text: text || "", hash });
+  // styled: real per-run colors + CJK-aligned columns for the live terminal view.
+  // Optional/additive — older app builds just read `text`.
+  const styled = await cmux.readTerminalStyled(id);
+  return jsonResponse(res, 200, { id, text: text || "", hash, styled });
+}
+
+// GET /cmux/file?id=<terminalId>&path=<rel-or-abs path> — read a file/dir for the
+// phone. Relative paths resolve against the terminal's cwd; absolute paths are
+// honored. Access is allowed ANYWHERE the Mac user can read EXCEPT a denylist of
+// sensitive locations (SSH/cloud creds, keychains, the bridge's own tokens, etc).
+// Text only, size-capped.
+const CMUX_FILE_MAX = 512 * 1024; // 512 KB
+const CMUX_IMAGE_MAX = 8 * 1024 * 1024; // 8 MB (base64'd inline for preview)
+const CMUX_IMAGE_EXT = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+  ".heic": "image/heic", ".heif": "image/heif",
+  ".tiff": "image/tiff", ".tif": "image/tiff", ".ico": "image/x-icon",
+};
+
+// Sensitive directories/files the phone must never read, even though the Mac user
+// can. Matched against BOTH the resolved path and its realpath (defeats symlinks).
+const CMUX_DENY_DIRS = (() => {
+  const home = os.homedir();
+  return [
+    path.join(home, ".ssh"),
+    path.join(home, ".aws"),
+    path.join(home, ".gnupg"),
+    path.join(home, ".kube"),
+    path.join(home, ".docker"),
+    path.join(home, ".config", "gh"),
+    path.join(home, ".config", "gcloud"),
+    path.join(home, "Library", "Keychains"),
+    // the bridge's own credentials/tokens — reading these would leak pairing tokens
+    path.join(home, "Library", "Application Support", "cmux-iphone"),
+    "/Library/Keychains",
+    "/private/etc/ssh",
+    "/etc/ssh",
+  ];
+})();
+// Secret-ish filenames blocked wherever they live (private keys, credential files).
+const CMUX_DENY_NAMES = new Set([
+  "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".netrc",
+]);
+
+function cmuxPathDenied(p) {
+  if (CMUX_DENY_NAMES.has(path.basename(p))) return true;
+  for (const d of CMUX_DENY_DIRS) {
+    if (p === d || p.startsWith(d + path.sep)) return true;
+  }
+  return false;
+}
+
+async function handleCmuxFile(req, res) {
+  if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  const id = url.searchParams.get("id");
+  const rel = url.searchParams.get("path");
+  if (!id || !rel) return jsonResponse(res, 400, { error: "Missing id or path" });
+
+  const cwd = await cmux.terminalCwd(id);
+  if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
+
+  // Resolve relative paths against cwd; honor absolute paths. realpath defeats
+  // symlinks. The denylist is checked against both the resolved path and its
+  // realpath so neither a direct path nor a symlink can reach a secret.
+  let target, rp;
+  try {
+    const base = path.resolve(cwd);
+    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
+    rp = await fs.promises.realpath(target);
+  } catch {
+    return jsonResponse(res, 404, { error: "not-found" });
+  }
+  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) {
+    return jsonResponse(res, 403, { error: "denied" });
+  }
+
+  let st;
+  try { st = await fs.promises.stat(rp); } catch { return jsonResponse(res, 404, { error: "not-found" }); }
+
+  // Directory → return a (capped) listing so the phone can browse into it.
+  if (st.isDirectory()) {
+    let dirents;
+    try { dirents = await fs.promises.readdir(rp, { withFileTypes: true }); }
+    catch { return jsonResponse(res, 500, { error: "read-failed" }); }
+    const CAP = 2000;
+    const truncated = dirents.length > CAP;
+    const entries = dirents.slice(0, CAP).map((d) => {
+      const full = path.join(rp, d.name);
+      let isDir = d.isDirectory();
+      if (d.isSymbolicLink()) {
+        try { isDir = fs.statSync(full).isDirectory(); } catch { isDir = false; }
+      }
+      return { name: d.name, dir: isDir, path: full };
+    })
+      .filter((e) => !cmuxPathDenied(e.path)) // hide secrets from listings
+      .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : (a.dir ? -1 : 1)));
+    return jsonResponse(res, 200, {
+      type: "dir",
+      name: path.basename(rp) || rp,
+      path: rp,
+      entries,
+      truncated,
+    });
+  }
+  if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
+
+  // Images → return base64 so the phone can render a preview (instead of the
+  // "binary file" rejection). Capped; oversized images report tooLarge.
+  const imgMime = CMUX_IMAGE_EXT[path.extname(rp).toLowerCase()];
+  if (imgMime) {
+    if (st.size > CMUX_IMAGE_MAX) {
+      return jsonResponse(res, 200, {
+        type: "image", name: path.basename(rp), path: rp, mime: imgMime,
+        size: st.size, tooLarge: true,
+      });
+    }
+    let imgBuf;
+    try { imgBuf = await fs.promises.readFile(rp); }
+    catch { return jsonResponse(res, 500, { error: "read-failed" }); }
+    return jsonResponse(res, 200, {
+      type: "image", name: path.basename(rp), path: rp, mime: imgMime,
+      size: st.size, data: imgBuf.toString("base64"),
+    });
+  }
+
+  let fh;
+  try {
+    fh = await fs.promises.open(rp, "r");
+    const len = Math.min(st.size, CMUX_FILE_MAX);
+    const buf = Buffer.alloc(len);
+    await fh.read(buf, 0, len, 0);
+    // crude binary sniff — a NUL byte in the first chunk means "not text".
+    if (buf.includes(0)) return jsonResponse(res, 415, { error: "binary-file" });
+    return jsonResponse(res, 200, {
+      type: "file",
+      name: path.basename(rp),
+      path: rp,
+      content: buf.toString("utf8"),
+      size: st.size,
+      truncated: st.size > CMUX_FILE_MAX,
+    });
+  } catch {
+    return jsonResponse(res, 500, { error: "read-failed" });
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
 }
 
 // --- cmux events -> SSE (live mirror updates) ------------------------------
@@ -1986,6 +2136,7 @@ const routes = {
   "GET /pair-code": handlePairCode,
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,
+  "GET /cmux/file": handleCmuxFile,
 };
 
 function isLocalRequest(req) {
