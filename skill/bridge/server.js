@@ -2135,8 +2135,11 @@ async function handleCmuxUpload(req, res) {
 // the OMC statusline shows "| thinking". Reads are bounded-concurrent.
 function classifyTerminalState(text) {
   const t = (text || "").toLowerCase();
+  // "esc to interrupt" (Claude Code / Codex) is the ONLY reliable "actively
+  // generating" marker. The OMC statusline "| thinking" is a reasoning-MODE
+  // label shown even on idle sessions, so it must NOT count as running.
   if (t.includes("esc to interrupt")) return "running";
-  if (/\|\s*thinking\b/.test(t) || /\bthinking\s*[…|]/.test(t)) return "running";
+  if (t.includes("esc to cancel")) return "running";
   return "idle";
 }
 
