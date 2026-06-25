@@ -460,7 +460,7 @@ private struct WorkspacesView: View {
 
             Spacer()
             if status != .idle {
-                DashStatusBadge(status: status, showLabel: status == .approval)
+                DashStatusBadge(status: status, showLabel: true)
             }
             if ws.hasUnread {
                 Circle().fill(Color.claudeAmber).frame(width: 8, height: 8)
@@ -599,18 +599,20 @@ private struct WorkspacesView: View {
 
 private enum DashStatus: Int {
     case approval = 0, running = 1, idle = 2
+    // Intuitive mapping: running = green (active/go), approval = red (needs you),
+    // idle = muted gray (nothing happening).
     var color: Color {
         switch self {
         case .approval: return .denyRed
-        case .running: return .claudeAmber
-        case .idle: return .statusGreen
+        case .running: return .statusGreen
+        case .idle: return .subtleText
         }
     }
     var label: String {
         switch self {
-        case .approval: return "승인 대기"
+        case .approval: return "승인 필요"
         case .running: return "실행 중"
-        case .idle: return "유휴"
+        case .idle: return "대기"
         }
     }
 }
@@ -632,20 +634,37 @@ private func dashWorkspaceStatus(_ ws: CmuxWorkspace, waiting: Set<String>, runn
     return .idle
 }
 
-/// Small status pill (colored dot + label) reused across dashboard, project, and
-/// session views.
+/// Status pill (colored dot + label) reused across dashboard, project, and
+/// session views. Running pulses + gets a tinted capsule so it's unmistakable;
+/// idle stays muted.
 private struct DashStatusBadge: View {
     let status: DashStatus
     var showLabel = true
+    @State private var pulse = false
+
     var body: some View {
         HStack(spacing: 5) {
-            Circle().fill(status.color).frame(width: 8, height: 8)
+            Circle()
+                .fill(status.color)
+                .frame(width: status == .idle ? 7 : 9, height: status == .idle ? 7 : 9)
+                .scaleEffect(status == .running && pulse ? 1.35 : 1.0)
+                .opacity(status == .running && pulse ? 0.55 : 1.0)
+                .animation(status == .running
+                    ? .easeInOut(duration: 0.7).repeatForever(autoreverses: true)
+                    : .default, value: pulse)
             if showLabel {
                 Text(status.label)
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(status.color)
             }
         }
+        .padding(.horizontal, status == .idle ? 0 : 7)
+        .padding(.vertical, status == .idle ? 0 : 3)
+        .background(
+            status == .idle ? Color.clear : status.color.opacity(0.14),
+            in: Capsule()
+        )
+        .onAppear { pulse = true }
     }
 }
 
@@ -752,7 +771,6 @@ private struct SessionDashboardView: View {
                     ForEach(rows) { row in
                         NavigationLink(value: CmuxTerminalRoute(id: row.id, title: row.title)) {
                             HStack(spacing: 10) {
-                                Circle().fill(row.status.color).frame(width: 9, height: 9)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(row.title)
                                         .font(.system(size: 14))
@@ -764,12 +782,10 @@ private struct SessionDashboardView: View {
                                         .lineLimit(1)
                                 }
                                 Spacer(minLength: 6)
-                                Text(row.status.label)
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(row.status.color)
+                                DashStatusBadge(status: row.status)
                             }
                         }
-                        .listRowBackground(Color.cardBackground)
+                        .listRowBackground(row.status == .running ? Color.statusGreen.opacity(0.08) : Color.cardBackground)
                     }
                 }
                 .listStyle(.plain)
