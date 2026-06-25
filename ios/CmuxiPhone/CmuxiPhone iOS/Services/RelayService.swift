@@ -273,6 +273,11 @@ final class RelayService: ObservableObject {
         try? await bridgeClient.fetchCmuxScreen(terminalId: terminalId)
     }
 
+    /// Read a file or directory referenced in a terminal, scoped to its cwd.
+    func cmuxFile(_ terminalId: String, path: String) async -> CmuxNodeResult {
+        await bridgeClient.fetchCmuxFile(terminalId: terminalId, path: path)
+    }
+
     /// Send a prompt straight to a cmux terminal (types + Enter). Unguarded —
     /// for normal prompts where the screen is expected to keep changing.
     func sendCmux(terminalId: String, text: String) {

@@ -7,6 +7,69 @@ import UIKit
 struct CmuxScreen {
     let text: String
     let hash: String?
+    /// Real per-run colors + CJK-aligned grid for the live terminal view.
+    /// nil when the bridge can't read a styled screen (falls back to `text`).
+    let styled: CmuxStyledScreen?
+}
+
+/// One entry in the terminal's color palette (indexed by a run's `styleId`).
+struct CmuxStyle {
+    let fg: String?
+    let bg: String?
+    let bold: Bool
+    let italic: Bool
+    let underline: Bool
+    let faint: Bool
+    let inverse: Bool
+    let strike: Bool
+}
+
+/// A styled span of text on one terminal row.
+struct CmuxRun {
+    let text: String
+    let styleId: Int
+}
+
+/// A terminal screen carrying cmux's real colors. `palette[styleId]` resolves a
+/// run's color/attributes; `lines` are rows of runs, already CJK-aligned.
+struct CmuxStyledScreen {
+    let cols: Int
+    let bg: String
+    let fg: String
+    let palette: [CmuxStyle]
+    let lines: [[CmuxRun]]
+
+    func style(_ id: Int) -> CmuxStyle? {
+        (id >= 0 && id < palette.count) ? palette[id] : nil
+    }
+}
+
+/// One entry in a directory listing.
+struct CmuxDirEntry: Identifiable {
+    let id = UUID()
+    let name: String
+    let isDir: Bool
+    let path: String
+}
+
+/// A filesystem node read from the Mac, scoped to the terminal's working
+/// directory — either a text file (with `content`) or a directory (`entries`).
+struct CmuxNode {
+    enum Kind { case file, directory, image }
+    let kind: Kind
+    let name: String
+    let path: String
+    let content: String
+    let truncated: Bool
+    let entries: [CmuxDirEntry]
+    /// Decoded image bytes (image nodes only); nil if absent or too large.
+    let imageData: Data?
+}
+
+/// Result of a scoped node read (success or a human-readable failure reason).
+enum CmuxNodeResult {
+    case ok(CmuxNode)
+    case failed(String)
 }
 
 /// Result of a guarded cmux input send.
@@ -207,7 +270,97 @@ final class BridgeClient {
             throw BridgeError.networkError
         }
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        return CmuxScreen(text: (json?["text"] as? String) ?? "", hash: json?["hash"] as? String)
+        return CmuxScreen(
+            text: (json?["text"] as? String) ?? "",
+            hash: json?["hash"] as? String,
+            styled: Self.parseStyled(json?["styled"] as? [String: Any])
+        )
+    }
+
+    /// Parse the optional `styled` payload (palette + rows of runs). Returns nil
+    /// if absent or malformed so the caller falls back to plain `text`.
+    private static func parseStyled(_ obj: [String: Any]?) -> CmuxStyledScreen? {
+        guard let obj else { return nil }
+        let paletteRaw = obj["palette"] as? [[String: Any]] ?? []
+        let palette: [CmuxStyle] = paletteRaw.map { p in
+            CmuxStyle(
+                fg: p["fg"] as? String,
+                bg: p["bg"] as? String,
+                bold: p["bold"] as? Bool ?? false,
+                italic: p["italic"] as? Bool ?? false,
+                underline: p["underline"] as? Bool ?? false,
+                faint: p["faint"] as? Bool ?? false,
+                inverse: p["inverse"] as? Bool ?? false,
+                strike: p["strike"] as? Bool ?? false
+            )
+        }
+        let linesRaw = obj["lines"] as? [[[String: Any]]] ?? []
+        let lines: [[CmuxRun]] = linesRaw.map { row in
+            row.compactMap { run in
+                guard let t = run["t"] as? String else { return nil }
+                return CmuxRun(text: t, styleId: run["s"] as? Int ?? 0)
+            }
+        }
+        guard !lines.isEmpty else { return nil }
+        return CmuxStyledScreen(
+            cols: obj["cols"] as? Int ?? 0,
+            bg: obj["bg"] as? String ?? "#1E1E1E",
+            fg: obj["fg"] as? String ?? "#FFFFFF",
+            palette: palette,
+            lines: lines
+        )
+    }
+
+    /// Read a file or directory referenced in the terminal, scoped server-side to
+    /// the terminal's working directory. Returns a human-readable failure on error.
+    func fetchCmuxFile(terminalId: String, path filePath: String) async -> CmuxNodeResult {
+        guard let baseURL, let token else { return .failed("브리지에 연결되어 있지 않습니다") }
+        var comps = URLComponents(url: baseURL.appendingPathComponent("cmux/file"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: terminalId),
+            URLQueryItem(name: "path", value: filePath),
+        ]
+        guard let url = comps?.url else { return .failed("경로가 올바르지 않습니다") }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await performRequest(request)
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            guard let http = response as? HTTPURLResponse else { return .failed("응답이 없습니다") }
+            guard (200..<300).contains(http.statusCode) else {
+                return .failed(Self.fileErrorMessage(json?["error"] as? String, status: http.statusCode))
+            }
+            let type = json?["type"] as? String
+            let entries: [CmuxDirEntry] = (json?["entries"] as? [[String: Any]] ?? []).compactMap { e in
+                guard let name = e["name"] as? String, let p = e["path"] as? String else { return nil }
+                return CmuxDirEntry(name: name, isDir: e["dir"] as? Bool ?? false, path: p)
+            }
+            let kind: CmuxNode.Kind = type == "dir" ? .directory : (type == "image" ? .image : .file)
+            let imageData = (json?["data"] as? String).flatMap { Data(base64Encoded: $0) }
+            return .ok(CmuxNode(
+                kind: kind,
+                name: json?["name"] as? String ?? (filePath as NSString).lastPathComponent,
+                path: json?["path"] as? String ?? filePath,
+                content: json?["content"] as? String ?? "",
+                // image: `tooLarge` reuses the truncated flag for the "too big" notice
+                truncated: (json?["truncated"] as? Bool ?? false) || (json?["tooLarge"] as? Bool ?? false),
+                entries: entries,
+                imageData: imageData
+            ))
+        } catch {
+            return .failed("불러오지 못했습니다")
+        }
+    }
+
+    private static func fileErrorMessage(_ reason: String?, status: Int) -> String {
+        switch reason {
+        case "denied", "outside-workspace": return "보안상 열 수 없는 경로입니다 (민감 파일)"
+        case "binary-file": return "바이너리 파일은 미리볼 수 없습니다"
+        case "is-a-directory": return "폴더입니다 (파일이 아님)"
+        case "not-a-file", "not-found": return "파일을 찾을 수 없습니다"
+        case "terminal-cwd-unavailable": return "터미널 작업 폴더를 확인할 수 없습니다"
+        default: return "열 수 없습니다 (\(status))"
+        }
     }
 
     /// Send input to a cmux terminal, guarded by the screen hash the phone last

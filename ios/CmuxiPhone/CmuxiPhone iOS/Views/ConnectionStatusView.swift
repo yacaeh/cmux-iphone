@@ -664,8 +664,13 @@ private struct CmuxTerminalView: View {
     @EnvironmentObject private var relayService: RelayService
 
     @State private var screen: String = ""
+    @State private var styledScreen: CmuxStyledScreen? = nil
+    /// Cached colored render — rebuilt only when the screen changes (not on every
+    /// keystroke), so typing in the prompt stays snappy.
+    @State private var rendered: AttributedString? = nil
     @State private var promptText: String = ""
     @State private var sending = false
+    @State private var browseTarget: BrowseTarget? = nil
     @State private var showModelSheet = false
     @State private var codexDriving = false
     @State private var codexStatus = ""
@@ -719,6 +724,18 @@ private struct CmuxTerminalView: View {
             }
         }
         .animation(.spring(response: 0.25, dampingFraction: 0.85), value: showModelSheet)
+        // Tapping a file path in the terminal opens it (scoped to the cwd).
+        .environment(\.openURL, OpenURLAction { url in
+            guard url.scheme == "cmuxfile" else { return .systemAction }
+            let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "p" })?.value
+            if let p, !p.isEmpty { browseTarget = BrowseTarget(path: p) }
+            return .handled
+        })
+        .sheet(item: $browseTarget) { t in
+            CmuxBrowser(terminalId: terminalId, rootPath: t.path)
+                .environmentObject(relayService)
+        }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -738,8 +755,15 @@ private struct CmuxTerminalView: View {
     private func refresh() async {
         if let s = await relayService.cmuxScreen(terminalId) {
             screen = s.text
+            styledScreen = s.styled
+            if let st = s.styled, !st.lines.isEmpty {
+                rendered = Self.attributedScreen(st)
+            } else {
+                rendered = nil
+            }
         }
     }
+
 
     private func closeModelSheet() {
         withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { showModelSheet = false }
@@ -856,9 +880,7 @@ private struct CmuxTerminalView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    Text(screen.isEmpty ? "…" : screen)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(Color.textPrimary)
+                    terminalScreen
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                         .padding(12)
@@ -870,9 +892,91 @@ private struct CmuxTerminalView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .background(Color.cardBackground)
+        .background(terminalBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.hairline, lineWidth: 1))
+    }
+
+    // Terminal screen background — cmux's real default bg when known, so #666666
+    // gray (faint) text reads the same as it does in your real terminal.
+    private var terminalBackground: Color {
+        if let bg = styledScreen?.bg { return Color(hex: bg) }
+        return Color.cardBackground
+    }
+
+    // Terminal content: cmux's real per-run colors when a styled screen is
+    // available, else a single-color monospace fallback.
+    @ViewBuilder
+    private var terminalScreen: some View {
+        if let rendered {
+            Text(rendered)
+                .font(.system(size: 12, design: .monospaced))
+                .lineSpacing(2)
+        } else {
+            Text(screen.isEmpty ? "…" : screen)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(Color.textPrimary)
+        }
+    }
+
+    // Build a colored AttributedString from the styled screen. Each run takes its
+    // foreground/attributes from the palette; inverse swaps fg/bg, faint dims.
+    private static func attributedScreen(_ styled: CmuxStyledScreen) -> AttributedString {
+        var out = AttributedString()
+        let defaultFg = Color(hex: styled.fg)
+        let lineCount = styled.lines.count
+        for (i, line) in styled.lines.enumerated() {
+            for run in line {
+                var piece = AttributedString(run.text)
+                let st = styled.style(run.styleId)
+                var font = Font.system(size: 12, design: .monospaced)
+                if st?.bold == true { font = font.bold() }
+                if st?.italic == true { font = font.italic() }
+                piece.font = font
+
+                let inverse = st?.inverse == true
+                let fgHex = inverse ? st?.bg : st?.fg
+                var fg = fgHex.map { Color(hex: $0) } ?? defaultFg
+                if st?.faint == true { fg = fg.opacity(0.6) }
+                piece.foregroundColor = fg
+
+                if inverse {
+                    piece.backgroundColor = (st?.fg).map { Color(hex: $0) } ?? defaultFg
+                } else if let bg = st?.bg, bg != styled.bg {
+                    piece.backgroundColor = Color(hex: bg)
+                }
+                if st?.underline == true { piece.underlineStyle = .single }
+                if st?.strike == true { piece.strikethroughStyle = .single }
+                linkifyPaths(&piece, in: run.text)
+                out.append(piece)
+            }
+            if i < lineCount - 1 { out.append(AttributedString("\n")) }
+        }
+        return out
+    }
+
+    // File-path-ish tokens — must contain a slash so plain words aren't linkified.
+    // Matches: src/foo/bar.tsx · ./scripts/x.sh · cinepilot/license/badge.tsx
+    private static let pathRegex = #/(?:\.{0,2}/)?(?:[\w.@~+-]+/)+[\w.@~+-]+(?:\.[A-Za-z][\w-]{0,9})?/#
+
+    // Mark path substrings inside one run as tappable links (cmuxfile://f?p=…).
+    private static func linkifyPaths(_ piece: inout AttributedString, in text: String) {
+        for match in text.matches(of: pathRegex) {
+            let r = match.range
+            let lo = text.distance(from: text.startIndex, to: r.lowerBound)
+            let hi = text.distance(from: text.startIndex, to: r.upperBound)
+            guard lo < hi else { continue }
+            let aLo = piece.index(piece.startIndex, offsetByCharacters: lo)
+            let aHi = piece.index(piece.startIndex, offsetByCharacters: hi)
+            let raw = String(text[r])
+            var allowed = CharacterSet.urlQueryAllowed
+            allowed.remove(charactersIn: "&=?+#")
+            guard let enc = raw.addingPercentEncoding(withAllowedCharacters: allowed),
+                  let url = URL(string: "cmuxfile://f?p=\(enc)") else { continue }
+            piece[aLo..<aHi].link = url
+            piece[aLo..<aHi].underlineStyle = .single
+            piece[aLo..<aHi].foregroundColor = .claudeOrange
+        }
     }
 
     private var inputBar: some View {
@@ -920,6 +1024,200 @@ private struct CmuxTerminalView: View {
             try? await Task.sleep(nanoseconds: 400_000_000)
             await refresh()
         }
+    }
+}
+
+/// Identifies a tapped path to browse (file or directory).
+private struct BrowseTarget: Identifiable {
+    let id = UUID()
+    let path: String
+}
+
+/// File/directory browser presented when a terminal path is tapped. Wraps a
+/// NavigationStack so directories push deeper and files show their content.
+private struct CmuxBrowser: View {
+    let terminalId: String
+    let rootPath: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            CmuxNodeScreen(terminalId: terminalId, path: rootPath)
+                .navigationDestination(for: String.self) { p in
+                    CmuxNodeScreen(terminalId: terminalId, path: p)
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("닫기") { dismiss() }
+                    }
+                }
+        }
+    }
+}
+
+/// Fetches one node (file or directory) and renders it: text content for files,
+/// a tappable listing for directories. Each row navigates by relative path.
+private struct CmuxNodeScreen: View {
+    let terminalId: String
+    let path: String
+    @EnvironmentObject private var relayService: RelayService
+
+    @State private var node: CmuxNode? = nil
+    @State private var errorMessage: String? = nil
+    @State private var loading = true
+
+    var body: some View {
+        Group {
+            if loading {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let errorMessage {
+                VStack(spacing: 12) {
+                    Image(systemName: "doc.questionmark")
+                        .font(.system(size: 34))
+                        .foregroundStyle(Color.subtleText)
+                    Text(errorMessage)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Color.textPrimary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding()
+            } else if let node {
+                switch node.kind {
+                case .directory: directoryList(node)
+                case .file: fileContent(node)
+                case .image: imageContent(node)
+                }
+            }
+        }
+        .background(Color.appBackground)
+        .navigationTitle((path as NSString).lastPathComponent.isEmpty ? "/" : (path as NSString).lastPathComponent)
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: path) { await load() }
+    }
+
+    @ViewBuilder
+    private func directoryList(_ node: CmuxNode) -> some View {
+        List {
+            if node.entries.isEmpty {
+                Text("(빈 폴더)").foregroundStyle(Color.subtleText)
+            }
+            ForEach(node.entries) { entry in
+                NavigationLink(value: entry.path) {
+                    Label {
+                        Text(entry.name).foregroundStyle(Color.textPrimary)
+                    } icon: {
+                        Image(systemName: entry.isDir ? "folder.fill" : "doc.text")
+                            .foregroundStyle(entry.isDir ? Color.claudeAmber : Color.subtleText)
+                    }
+                    .font(.system(size: 14, design: entry.isDir ? .default : .monospaced))
+                }
+            }
+            if node.truncated {
+                Text("…일부만 표시 (항목이 많음)")
+                    .font(.system(size: 11)).foregroundStyle(Color.claudeAmber)
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+    }
+
+    @ViewBuilder
+    private func fileContent(_ node: CmuxNode) -> some View {
+        ScrollView([.vertical, .horizontal]) {
+            Text(node.content.isEmpty ? "(빈 파일)" : node.content)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(Color.textPrimary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: true, vertical: true)
+                .padding(12)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if node.truncated {
+                Text("일부만 표시 (큰 파일)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.claudeAmber)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.vertical, 4)
+                    .background(Color.surfaceElevated)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func imageContent(_ node: CmuxNode) -> some View {
+        if let data = node.imageData, let ui = UIImage(data: data) {
+            ZoomableImage(image: ui)
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "photo")
+                    .font(.system(size: 34))
+                    .foregroundStyle(Color.subtleText)
+                Text(node.truncated ? "이미지가 너무 큽니다 (8MB 초과)" : "이미지를 표시할 수 없습니다")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+        }
+    }
+
+    private func load() async {
+        loading = true
+        errorMessage = nil
+        switch await relayService.cmuxFile(terminalId, path: path) {
+        case .ok(let n): node = n
+        case .failed(let msg): errorMessage = msg
+        }
+        loading = false
+    }
+}
+
+/// Pinch-to-zoom + pan image viewer. Double-tap toggles fit/2×.
+private struct ZoomableImage: View {
+    let image: UIImage
+
+    @State private var scale: CGFloat = 1
+    @GestureState private var pinch: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @GestureState private var drag: CGSize = .zero
+
+    private let minScale: CGFloat = 1
+    private let maxScale: CGFloat = 8
+
+    var body: some View {
+        let magnify = MagnificationGesture()
+            .updating($pinch) { value, state, _ in state = value }
+            .onEnded { value in
+                scale = min(max(scale * value, minScale), maxScale)
+                if scale <= minScale { withAnimation(.easeOut(duration: 0.2)) { offset = .zero } }
+            }
+        let pan = DragGesture()
+            .updating($drag) { value, state, _ in state = value.translation }
+            .onEnded { value in
+                offset.width += value.translation.width
+                offset.height += value.translation.height
+            }
+        let effectiveScale = scale * pinch
+
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFit()
+            .scaleEffect(effectiveScale)
+            .offset(x: offset.width + drag.width, y: offset.height + drag.height)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(pan)
+            .simultaneousGesture(magnify)
+            .onTapGesture(count: 2) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    if scale > minScale { scale = minScale; offset = .zero }
+                    else { scale = 2 }
+                }
+            }
+            .background(Color.appBackground)
+            .clipped()
     }
 }
 
