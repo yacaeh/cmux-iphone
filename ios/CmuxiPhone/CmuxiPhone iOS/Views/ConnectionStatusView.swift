@@ -13,6 +13,7 @@ private struct SessionRoute: Hashable { let sessionId: String }
 // cmux mirror routes (when the Mac runs cmux): Office → Workspace → Terminal
 private struct CmuxWorkspaceRoute: Hashable { let id: String }
 private struct CmuxTerminalRoute: Hashable { let id: String; let title: String }
+private struct DashboardRoute: Hashable {}
 
 // MARK: - cmux mirror models (decoded from GET /cmux/tree)
 
@@ -94,6 +95,16 @@ struct ConnectionStatusView: View {
                         }
                     }
                 }
+                if relayService.cmuxAvailable {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            path.append(DashboardRoute())
+                        } label: {
+                            Image(systemName: "square.grid.2x2")
+                                .foregroundStyle(Color.subtleText)
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true
@@ -117,6 +128,9 @@ struct ConnectionStatusView: View {
             }
             .navigationDestination(for: CmuxTerminalRoute.self) { route in
                 CmuxTerminalView(terminalId: route.id, title: route.title)
+            }
+            .navigationDestination(for: DashboardRoute.self) { _ in
+                SessionDashboardView()
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -574,6 +588,130 @@ private struct WorkspacesView: View {
 }
 
 // MARK: - Level 3: Sessions in a folder — SCREEN 04
+
+// MARK: - cmux mirror: cross-workspace session dashboard
+
+private enum DashStatus: Int {
+    case approval = 0, running = 1, idle = 2
+    var color: Color {
+        switch self {
+        case .approval: return .denyRed
+        case .running: return .claudeAmber
+        case .idle: return .statusGreen
+        }
+    }
+    var label: String {
+        switch self {
+        case .approval: return "승인 대기"
+        case .running: return "실행 중"
+        case .idle: return "유휴"
+        }
+    }
+}
+
+/// Flat, cross-workspace view of every terminal with a status badge, so the user
+/// can spot what needs attention. "주목 필요만" filters to terminals awaiting approval.
+private struct SessionDashboardView: View {
+    @EnvironmentObject private var relayService: RelayService
+    @State private var attentionOnly = false
+
+    private struct Row: Identifiable {
+        let id: String
+        let title: String
+        let workspace: String
+        let status: DashStatus
+    }
+
+    // Running ⇔ the title leads with a braille spinner glyph (cmux shows one while
+    // the agent is working); ✳ and other markers count as idle.
+    private func isRunning(_ title: String) -> Bool {
+        guard let first = title.unicodeScalars.first(where: { !CharacterSet.whitespaces.contains($0) }) else { return false }
+        return (0x2800...0x28FF).contains(first.value)
+    }
+
+    private var rows: [Row] {
+        let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
+        var out: [Row] = []
+        for ws in relayService.cmuxWorkspaces {
+            for t in ws.terminals {
+                let status: DashStatus = waiting.contains(t.id) ? .approval
+                    : (isRunning(t.title) ? .running : .idle)
+                out.append(Row(id: t.id, title: t.title, workspace: ws.title, status: status))
+            }
+        }
+        out.sort { $0.status.rawValue != $1.status.rawValue ? $0.status.rawValue < $1.status.rawValue : $0.title < $1.title }
+        return attentionOnly ? out.filter { $0.status == .approval } : out
+    }
+
+    private func count(_ s: DashStatus) -> Int {
+        let waiting = Set(relayService.approvalQueue.compactMap { $0.terminalId })
+        return relayService.cmuxWorkspaces.flatMap(\.terminals).filter {
+            (waiting.contains($0.id) ? DashStatus.approval : (isRunning($0.title) ? .running : .idle)) == s
+        }.count
+    }
+
+    var body: some View {
+        ZStack {
+            Color.appBackground.ignoresSafeArea()
+            VStack(spacing: 0) {
+                // Summary counts
+                HStack(spacing: 14) {
+                    summaryChip(.approval, count(.approval))
+                    summaryChip(.running, count(.running))
+                    summaryChip(.idle, count(.idle))
+                    Spacer()
+                    Toggle("주목 필요만", isOn: $attentionOnly)
+                        .toggleStyle(.button)
+                        .font(.system(size: 12, weight: .semibold))
+                        .tint(Color.claudeOrange)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+
+                List {
+                    if rows.isEmpty {
+                        Text(attentionOnly ? "주목할 세션이 없습니다" : "세션이 없습니다")
+                            .foregroundStyle(Color.subtleText)
+                            .listRowBackground(Color.clear)
+                    }
+                    ForEach(rows) { row in
+                        NavigationLink(value: CmuxTerminalRoute(id: row.id, title: row.title)) {
+                            HStack(spacing: 10) {
+                                Circle().fill(row.status.color).frame(width: 9, height: 9)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(row.title)
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(Color.textPrimary)
+                                        .lineLimit(1)
+                                    Text(row.workspace)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Color.subtleText)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 6)
+                                Text(row.status.label)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(row.status.color)
+                            }
+                        }
+                        .listRowBackground(Color.cardBackground)
+                    }
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+            }
+        }
+        .navigationTitle("세션 대시보드")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func summaryChip(_ status: DashStatus, _ n: Int) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(status.color).frame(width: 8, height: 8)
+            Text("\(n)").font(.system(size: 14, weight: .bold)).foregroundStyle(Color.textPrimary)
+            Text(status.label).font(.system(size: 11)).foregroundStyle(Color.subtleText)
+        }
+    }
+}
 
 // MARK: - cmux mirror: terminals in a workspace
 

@@ -4,7 +4,7 @@ import UserNotifications
 /// Converts bridge events into local notifications.
 /// Posts approval-needed and task-complete notifications when the app
 /// is backgrounded, so the user is aware of events requiring attention.
-final class NotificationService {
+final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: - Notification identifiers
 
@@ -12,12 +12,25 @@ final class NotificationService {
     private static let approveAction = "APPROVE_ACTION"
     private static let denyAction = "DENY_ACTION"
     private static let taskCompleteCategory = "TASK_COMPLETE"
+    private static let errorCategory = "AGENT_ERROR"
 
     // MARK: - Init
 
-    init() {
+    override init() {
+        super.init()
+        // Become the delegate so notifications also present while the app is in
+        // the foreground (otherwise iOS silently suppresses them when open).
+        UNUserNotificationCenter.current().delegate = self
         requestAuthorization()
         registerCategories()
+    }
+
+    // MARK: - Foreground presentation
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound, .badge])
     }
 
     // MARK: - Authorization
@@ -102,6 +115,26 @@ final class NotificationService {
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
                 print("[NotificationService] Failed to post task-complete notification: \(error)")
+            }
+        }
+    }
+
+    /// Posts a notification that an agent hit an error.
+    func postError(_ message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "에이전트 오류"
+        content.body = message
+        content.sound = .default
+        content.categoryIdentifier = Self.errorCategory
+
+        let request = UNNotificationRequest(
+            identifier: "error-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                print("[NotificationService] Failed to post error notification: \(error)")
             }
         }
     }

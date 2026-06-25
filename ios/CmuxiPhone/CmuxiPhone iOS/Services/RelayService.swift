@@ -1033,6 +1033,7 @@ final class RelayService: ObservableObject {
         terminalBuffer.append(line)
         appendToSession(line, sessionId: sid)
         recentTerminalLines = terminalBuffer.getLast(15)
+        notificationService.postError(errorMsg)
     }
 
     private func handleStop(_ data: String) {
