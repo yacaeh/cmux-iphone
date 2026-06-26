@@ -2181,24 +2181,53 @@ async function handleCmuxStatuses(req, res) {
 const tcpProxies = new Map(); // targetPort -> { server, proxyPort }
 const MAX_PROXIES = 64;
 
+// HTTP-level proxy (not raw TCP): it rewrites the Host header to
+// "localhost:<targetPort>" so dev servers that validate Host (Vite/Next/
+// webpack — they otherwise show "Blocked request"/a host-check page) accept it.
+// Absolute-PATH assets (/assets/x.js) still work because the proxy root maps to
+// the dev-server root. Websocket upgrades (HMR) are forwarded with Host rewritten.
 function ensureTcpProxy(targetPort) {
   return new Promise((resolve, reject) => {
     const existing = tcpProxies.get(targetPort);
     if (existing) return resolve(existing.proxyPort);
     if (tcpProxies.size >= MAX_PROXIES) return reject(new Error("too-many-proxies"));
-    const server = net.createServer((client) => {
-      const upstream = net.connect(targetPort, "127.0.0.1");
-      client.on("error", () => upstream.destroy());
-      upstream.on("error", () => client.destroy());
-      client.pipe(upstream);
-      upstream.pipe(client);
+    const hostHeader = `localhost:${targetPort}`;
+
+    const server = http.createServer((creq, cres) => {
+      const preq = http.request(
+        { host: "127.0.0.1", port: targetPort, method: creq.method, path: creq.url,
+          headers: { ...creq.headers, host: hostHeader } },
+        (pres) => { cres.writeHead(pres.statusCode || 502, pres.headers); pres.pipe(cres); }
+      );
+      preq.on("error", () => { try { cres.writeHead(502); cres.end("proxy error"); } catch {} });
+      creq.pipe(preq);
     });
+
+    // Websocket / HTTP upgrade — replay the request line + headers (Host
+    // rewritten) to the upstream, then pipe both ways.
+    server.on("upgrade", (creq, csocket, head) => {
+      const upstream = net.connect(targetPort, "127.0.0.1", () => {
+        const headers = { ...creq.headers, host: hostHeader };
+        let raw = `${creq.method} ${creq.url} HTTP/1.1\r\n`;
+        for (const [k, v] of Object.entries(headers)) {
+          for (const val of (Array.isArray(v) ? v : [v])) raw += `${k}: ${val}\r\n`;
+        }
+        raw += "\r\n";
+        upstream.write(raw);
+        if (head && head.length) upstream.write(head);
+        upstream.pipe(csocket);
+        csocket.pipe(upstream);
+      });
+      upstream.on("error", () => csocket.destroy());
+      csocket.on("error", () => upstream.destroy());
+    });
+
     server.on("error", reject);
     // Bind to the same interface as the API so the phone reaches it the same way.
     server.listen(0, BIND_ADDRESS, () => {
       const proxyPort = server.address().port;
       tcpProxies.set(targetPort, { server, proxyPort });
-      log("info", `proxy: ${BIND_ADDRESS}:${proxyPort} -> 127.0.0.1:${targetPort}`);
+      log("info", `proxy: ${BIND_ADDRESS}:${proxyPort} -> 127.0.0.1:${targetPort} (Host: ${hostHeader})`);
       resolve(proxyPort);
     });
   });
