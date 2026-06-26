@@ -293,6 +293,10 @@ final class RelayService: ObservableObject {
         if let m = await bridgeClient.fetchCmuxStatuses() { terminalStatuses = m }
     }
 
+    /// Host of the bridge connection — the Mac's address the phone can actually
+    /// reach (Tailscale/LAN). Used to rewrite localhost URLs printed by agents.
+    var bridgeHost: String? { bridgeClient.baseURL?.host }
+
     /// Send a prompt straight to a cmux terminal (types + Enter). Unguarded —
     /// for normal prompts where the screen is expected to keep changing.
     func sendCmux(terminalId: String, text: String) {

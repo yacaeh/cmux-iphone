@@ -980,11 +980,22 @@ private struct CmuxTerminalView: View {
         .animation(.spring(response: 0.25, dampingFraction: 0.85), value: showModelSheet)
         // Tapping a file path in the terminal opens it (scoped to the cwd).
         .environment(\.openURL, OpenURLAction { url in
-            guard url.scheme == "cmuxfile" else { return .systemAction }
-            let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?.first(where: { $0.name == "p" })?.value
-            if let p, !p.isEmpty { browseTarget = BrowseTarget(path: p) }
-            return .handled
+            if url.scheme == "cmuxfile" {
+                let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "p" })?.value
+                if let p, !p.isEmpty { browseTarget = BrowseTarget(path: p) }
+                return .handled
+            }
+            if url.scheme == "http" || url.scheme == "https" {
+                // localhost dev URLs aren't reachable from the phone — rewrite the
+                // host to the Mac's bridge address (Tailscale/LAN) before opening.
+                if let rewritten = rewriteLocalhost(url) {
+                    UIApplication.shared.open(rewritten)
+                    return .handled
+                }
+                return .systemAction
+            }
+            return .systemAction
         })
         .sheet(item: $browseTarget) { t in
             CmuxBrowser(terminalId: terminalId, rootPath: t.path)
@@ -1201,7 +1212,7 @@ private struct CmuxTerminalView: View {
                 }
                 if st?.underline == true { piece.underlineStyle = .single }
                 if st?.strike == true { piece.strikethroughStyle = .single }
-                linkifyPaths(&piece, in: run.text)
+                linkify(&piece, in: run.text)
                 out.append(piece)
             }
             if i < lineCount - 1 { out.append(AttributedString("\n")) }
@@ -1209,28 +1220,48 @@ private struct CmuxTerminalView: View {
         return out
     }
 
+    // http(s) URLs printed by agents (server URLs, docs, etc.).
+    private static let urlRegex = #/https?:\/\/[^\s)\]}>"'`]+/#
     // File-path-ish tokens — must contain a slash so plain words aren't linkified.
     // Matches: src/foo/bar.tsx · ./scripts/x.sh · cinepilot/license/badge.tsx
     private static let pathRegex = #/(?:\.{0,2}/)?(?:[\w.@~+-]+/)+[\w.@~+-]+(?:\.[A-Za-z][\w-]{0,9})?/#
 
-    // Mark path substrings inside one run as tappable links (cmuxfile://f?p=…).
-    private static func linkifyPaths(_ piece: inout AttributedString, in text: String) {
+    // Linkify a run: web URLs (blue, open in browser — localhost is rewritten to
+    // the Mac's reachable host at tap time) and file paths (orange, cmuxfile://).
+    // URLs win over paths on overlap so "app/main.js" inside a URL isn't relinked.
+    private static func linkify(_ piece: inout AttributedString, in text: String) {
+        var urlRanges: [Range<String.Index>] = []
+        for match in text.matches(of: urlRegex) {
+            var s = String(text[match.range])
+            var trimmed = 0
+            while let last = s.last, ".,;:!?)]}>\"'".contains(last) { s.removeLast(); trimmed += 1 }
+            guard !s.isEmpty, let url = URL(string: s) else { continue }
+            let upper = text.index(match.range.upperBound, offsetBy: -trimmed)
+            let r = match.range.lowerBound..<upper
+            urlRanges.append(r)
+            applyLink(&piece, text: text, range: r, url: url, color: Color(hex: "5AA9FF"))
+        }
         for match in text.matches(of: pathRegex) {
-            let r = match.range
-            let lo = text.distance(from: text.startIndex, to: r.lowerBound)
-            let hi = text.distance(from: text.startIndex, to: r.upperBound)
-            guard lo < hi else { continue }
-            let aLo = piece.index(piece.startIndex, offsetByCharacters: lo)
-            let aHi = piece.index(piece.startIndex, offsetByCharacters: hi)
-            let raw = String(text[r])
+            if urlRanges.contains(where: { $0.overlaps(match.range) }) { continue }
+            let raw = String(text[match.range])
             var allowed = CharacterSet.urlQueryAllowed
             allowed.remove(charactersIn: "&=?+#")
             guard let enc = raw.addingPercentEncoding(withAllowedCharacters: allowed),
                   let url = URL(string: "cmuxfile://f?p=\(enc)") else { continue }
-            piece[aLo..<aHi].link = url
-            piece[aLo..<aHi].underlineStyle = .single
-            piece[aLo..<aHi].foregroundColor = .claudeOrange
+            applyLink(&piece, text: text, range: match.range, url: url, color: .claudeOrange)
         }
+    }
+
+    private static func applyLink(_ piece: inout AttributedString, text: String,
+                                  range: Range<String.Index>, url: URL, color: Color) {
+        let lo = text.distance(from: text.startIndex, to: range.lowerBound)
+        let hi = text.distance(from: text.startIndex, to: range.upperBound)
+        guard lo < hi else { return }
+        let aLo = piece.index(piece.startIndex, offsetByCharacters: lo)
+        let aHi = piece.index(piece.startIndex, offsetByCharacters: hi)
+        piece[aLo..<aHi].link = url
+        piece[aLo..<aHi].underlineStyle = .single
+        piece[aLo..<aHi].foregroundColor = color
     }
 
     // Quick special-key bar — interrupt a running agent (취소 = Ctrl-C), Esc, Tab,
@@ -1272,6 +1303,18 @@ private struct CmuxTerminalView: View {
             try? await Task.sleep(nanoseconds: 200_000_000)
             await refresh()
         }
+    }
+
+    // Agents print localhost URLs (dev servers) the phone can't reach. Swap the
+    // host for the Mac's bridge host (Tailscale/LAN) so the page opens. Returns
+    // nil for non-localhost URLs (those open as-is).
+    private func rewriteLocalhost(_ url: URL) -> URL? {
+        guard let host = url.host?.lowercased(),
+              ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"].contains(host),
+              let bridgeHost = relayService.bridgeHost,
+              var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        comps.host = bridgeHost
+        return comps.url
     }
 
     private var inputBar: some View {
