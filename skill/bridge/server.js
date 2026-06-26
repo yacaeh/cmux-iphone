@@ -2171,6 +2171,57 @@ async function handleCmuxStatuses(req, res) {
   return jsonResponse(res, 200, { statuses });
 }
 
+// --- localhost dev-server proxy --------------------------------------------
+// Agents print http://localhost:<port> URLs for dev servers that bind only to
+// 127.0.0.1 and so are unreachable from the phone. On demand we stand up a raw
+// TCP forwarder on BIND_ADDRESS (the Tailscale/LAN interface the phone reaches)
+// that pipes to 127.0.0.1:<port>. Raw TCP = HTTP, assets, and websockets all
+// pass through untouched, and the proxy root maps to the dev-server root so
+// absolute asset paths work. One forwarder per target port (reused).
+const tcpProxies = new Map(); // targetPort -> { server, proxyPort }
+const MAX_PROXIES = 64;
+
+function ensureTcpProxy(targetPort) {
+  return new Promise((resolve, reject) => {
+    const existing = tcpProxies.get(targetPort);
+    if (existing) return resolve(existing.proxyPort);
+    if (tcpProxies.size >= MAX_PROXIES) return reject(new Error("too-many-proxies"));
+    const server = net.createServer((client) => {
+      const upstream = net.connect(targetPort, "127.0.0.1");
+      client.on("error", () => upstream.destroy());
+      upstream.on("error", () => client.destroy());
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+    server.on("error", reject);
+    // Bind to the same interface as the API so the phone reaches it the same way.
+    server.listen(0, BIND_ADDRESS, () => {
+      const proxyPort = server.address().port;
+      tcpProxies.set(targetPort, { server, proxyPort });
+      log("info", `proxy: ${BIND_ADDRESS}:${proxyPort} -> 127.0.0.1:${targetPort}`);
+      resolve(proxyPort);
+    });
+  });
+}
+
+// GET /proxy/open?port=3000 — ensure a forwarder exists for a localhost port,
+// returning the proxy port the phone should connect to (on the bridge host).
+async function handleProxyOpen(req, res) {
+  if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  const port = parseInt(url.searchParams.get("port"), 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return jsonResponse(res, 400, { error: "invalid-port" });
+  }
+  try {
+    const proxyPort = await ensureTcpProxy(port);
+    return jsonResponse(res, 200, { targetPort: port, proxyPort });
+  } catch {
+    return jsonResponse(res, 500, { error: "proxy-failed" });
+  }
+}
+
 // --- cmux events -> SSE (live mirror updates) ------------------------------
 let cmuxEventChild = null;
 let cmuxRespawnTimer = null;
@@ -2233,6 +2284,7 @@ const routes = {
   "GET /cmux/screen": handleCmuxScreen,
   "GET /cmux/file": handleCmuxFile,
   "GET /cmux/statuses": handleCmuxStatuses,
+  "GET /proxy/open": handleProxyOpen,
   "POST /cmux/upload": handleCmuxUpload,
 };
 

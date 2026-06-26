@@ -358,6 +358,25 @@ final class BridgeClient {
         }
     }
 
+    /// Ask the bridge to stand up a TCP forwarder for a localhost dev-server port
+    /// and return the proxy port the phone should connect to (on the bridge host).
+    func openProxy(port: Int) async -> Int? {
+        guard let baseURL, let token else { return nil }
+        var comps = URLComponents(url: baseURL.appendingPathComponent("proxy/open"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [URLQueryItem(name: "port", value: String(port))]
+        guard let url = comps?.url else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await performRequest(request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            return json?["proxyPort"] as? Int
+        } catch {
+            return nil
+        }
+    }
+
     /// Per-terminal run state ("running"/"idle"), derived server-side from the
     /// live screen. Returns nil on failure.
     func fetchCmuxStatuses() async -> [String: String]? {

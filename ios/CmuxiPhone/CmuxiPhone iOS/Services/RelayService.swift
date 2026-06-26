@@ -297,6 +297,12 @@ final class RelayService: ObservableObject {
     /// reach (Tailscale/LAN). Used to rewrite localhost URLs printed by agents.
     var bridgeHost: String? { bridgeClient.baseURL?.host }
 
+    /// Stand up (or reuse) a bridge-side forwarder for a localhost dev-server
+    /// port; returns the proxy port to connect to on the bridge host.
+    func openProxy(port: Int) async -> Int? {
+        await bridgeClient.openProxy(port: port)
+    }
+
     /// Send a prompt straight to a cmux terminal (types + Enter). Unguarded —
     /// for normal prompts where the screen is expected to keep changing.
     func sendCmux(terminalId: String, text: String) {

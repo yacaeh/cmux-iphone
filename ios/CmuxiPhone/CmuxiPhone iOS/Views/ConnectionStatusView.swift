@@ -987,10 +987,11 @@ private struct CmuxTerminalView: View {
                 return .handled
             }
             if url.scheme == "http" || url.scheme == "https" {
-                // localhost dev URLs aren't reachable from the phone — rewrite the
-                // host to the Mac's bridge address (Tailscale/LAN) before opening.
-                if let rewritten = rewriteLocalhost(url) {
-                    UIApplication.shared.open(rewritten)
+                // localhost dev URLs aren't reachable from the phone — route them
+                // through a bridge-side TCP proxy (works even for 127.0.0.1-only
+                // servers); non-localhost URLs open directly in the browser.
+                if isLocalhost(url) {
+                    openViaProxy(url)
                     return .handled
                 }
                 return .systemAction
@@ -1305,12 +1306,36 @@ private struct CmuxTerminalView: View {
         }
     }
 
-    // Agents print localhost URLs (dev servers) the phone can't reach. Swap the
-    // host for the Mac's bridge host (Tailscale/LAN) so the page opens. Returns
-    // nil for non-localhost URLs (those open as-is).
+    private func isLocalhost(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"].contains(host)
+    }
+
+    // Open a localhost dev URL via a bridge-side proxy: ask the bridge to forward
+    // the port, then open http://<bridgeHost>:<proxyPort><path> in the browser.
+    // Falls back to a plain host rewrite if the proxy can't be created.
+    private func openViaProxy(_ url: URL) {
+        let port = url.port ?? (url.scheme == "https" ? 443 : 80)
+        Task {
+            if let proxyPort = await relayService.openProxy(port: port),
+               let bridgeHost = relayService.bridgeHost,
+               var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                comps.host = bridgeHost
+                comps.port = proxyPort
+                if let out = comps.url {
+                    UIApplication.shared.open(out, options: [:], completionHandler: nil)
+                    return
+                }
+            }
+            if let rewritten = rewriteLocalhost(url) {
+                UIApplication.shared.open(rewritten, options: [:], completionHandler: nil)
+            }
+        }
+    }
+
+    // Fallback: swap the host for the Mac's bridge host (Tailscale/LAN), no proxy.
     private func rewriteLocalhost(_ url: URL) -> URL? {
-        guard let host = url.host?.lowercased(),
-              ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"].contains(host),
+        guard isLocalhost(url),
               let bridgeHost = relayService.bridgeHost,
               var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
         comps.host = bridgeHost
