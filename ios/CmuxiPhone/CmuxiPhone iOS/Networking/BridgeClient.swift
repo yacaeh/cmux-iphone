@@ -55,7 +55,7 @@ struct CmuxDirEntry: Identifiable {
 /// A filesystem node read from the Mac, scoped to the terminal's working
 /// directory — either a text file (with `content`) or a directory (`entries`).
 struct CmuxNode {
-    enum Kind { case file, directory, image }
+    enum Kind { case file, directory, image, video }
     let kind: Kind
     let name: String
     let path: String
@@ -341,7 +341,13 @@ final class BridgeClient {
                 guard let name = e["name"] as? String, let p = e["path"] as? String else { return nil }
                 return CmuxDirEntry(name: name, isDir: e["dir"] as? Bool ?? false, path: p)
             }
-            let kind: CmuxNode.Kind = type == "dir" ? .directory : (type == "image" ? .image : .file)
+            let kind: CmuxNode.Kind
+            switch type {
+            case "dir": kind = .directory
+            case "image": kind = .image
+            case "video": kind = .video
+            default: kind = .file
+            }
             let imageData = (json?["data"] as? String).flatMap { Data(base64Encoded: $0) }
             return .ok(CmuxNode(
                 kind: kind,
@@ -356,6 +362,19 @@ final class BridgeClient {
         } catch {
             return .failed("불러오지 못했습니다")
         }
+    }
+
+    /// Authenticated URL for streaming a media file (video) — token is in the
+    /// query so AVPlayer (which can't set headers) can play it directly.
+    func mediaURL(terminalId: String, path filePath: String) -> URL? {
+        guard let baseURL, let token else { return nil }
+        var comps = URLComponents(url: baseURL.appendingPathComponent("cmux/media"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: terminalId),
+            URLQueryItem(name: "path", value: filePath),
+            URLQueryItem(name: "token", value: token),
+        ]
+        return comps?.url
     }
 
     /// Ask the bridge to stand up a TCP forwarder for a localhost dev-server port

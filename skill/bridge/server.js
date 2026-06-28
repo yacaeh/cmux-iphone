@@ -1960,6 +1960,11 @@ const CMUX_IMAGE_EXT = {
   ".heic": "image/heic", ".heif": "image/heif",
   ".tiff": "image/tiff", ".tif": "image/tiff", ".ico": "image/x-icon",
 };
+// Videos are too big to inline — streamed via /cmux/media (Range-capable).
+const CMUX_VIDEO_EXT = {
+  ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+  ".webm": "video/webm", ".m3u8": "application/vnd.apple.mpegurl",
+};
 
 // Sensitive directories/files the phone must never read, even though the Mac user
 // can. Matched against BOTH the resolved path and its realpath (defeats symlinks).
@@ -2050,6 +2055,14 @@ async function handleCmuxFile(req, res) {
   }
   if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
 
+  // Videos → metadata only; the phone streams the bytes from /cmux/media.
+  const vidMime = CMUX_VIDEO_EXT[path.extname(rp).toLowerCase()];
+  if (vidMime) {
+    return jsonResponse(res, 200, {
+      type: "video", name: path.basename(rp), path: rp, mime: vidMime, size: st.size,
+    });
+  }
+
   // Images → return base64 so the phone can render a preview (instead of the
   // "binary file" rejection). Capped; oversized images report tooLarge.
   const imgMime = CMUX_IMAGE_EXT[path.extname(rp).toLowerCase()];
@@ -2127,6 +2140,67 @@ async function handleCmuxUpload(req, res) {
   } catch {
     return jsonResponse(res, 500, { error: "write-failed" });
   }
+}
+
+// GET /cmux/media?id=<terminalId>&path=<path>[&token=…] — stream a media file
+// (video) with HTTP Range support so the phone's player can seek. Same cwd
+// scoping + denylist as /cmux/file. Auth accepts a query token (AVPlayer can't
+// set headers). Raw bytes, not JSON.
+async function handleCmuxMedia(req, res) {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return jsonResponse(res, 405, { error: "Method not allowed" });
+  }
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  const id = url.searchParams.get("id");
+  const rel = url.searchParams.get("path");
+  if (!id || !rel) return jsonResponse(res, 400, { error: "Missing id or path" });
+
+  const cwd = await cmux.terminalCwd(id);
+  if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
+
+  let target, rp;
+  try {
+    const base = path.resolve(cwd);
+    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
+    rp = await fs.promises.realpath(target);
+  } catch {
+    return jsonResponse(res, 404, { error: "not-found" });
+  }
+  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) {
+    return jsonResponse(res, 403, { error: "denied" });
+  }
+  let st;
+  try { st = await fs.promises.stat(rp); } catch { return jsonResponse(res, 404, { error: "not-found" }); }
+  if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
+
+  const mime = CMUX_VIDEO_EXT[path.extname(rp).toLowerCase()] || "application/octet-stream";
+  const total = st.size;
+  const range = req.headers.range;
+  const baseHeaders = { "Content-Type": mime, "Accept-Ranges": "bytes" };
+
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    let start = m && m[1] ? parseInt(m[1], 10) : 0;
+    let end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+    if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+      res.writeHead(416, { "Content-Range": `bytes */${total}` });
+      return res.end();
+    }
+    end = Math.min(end, total - 1);
+    res.writeHead(206, {
+      ...baseHeaders,
+      "Content-Range": `bytes ${start}-${end}/${total}`,
+      "Content-Length": end - start + 1,
+    });
+    if (req.method === "HEAD") return res.end();
+    fs.createReadStream(rp, { start, end }).on("error", () => res.destroy()).pipe(res);
+    return;
+  }
+
+  res.writeHead(200, { ...baseHeaders, "Content-Length": total });
+  if (req.method === "HEAD") return res.end();
+  fs.createReadStream(rp).on("error", () => res.destroy()).pipe(res);
 }
 
 // GET /cmux/statuses — per-terminal run state for the dashboard. The cmux tree
@@ -2312,6 +2386,8 @@ const routes = {
   "GET /cmux/tree": handleCmuxTree,
   "GET /cmux/screen": handleCmuxScreen,
   "GET /cmux/file": handleCmuxFile,
+  "GET /cmux/media": handleCmuxMedia,
+  "HEAD /cmux/media": handleCmuxMedia,
   "GET /cmux/statuses": handleCmuxStatuses,
   "GET /proxy/open": handleProxyOpen,
   "POST /cmux/upload": handleCmuxUpload,

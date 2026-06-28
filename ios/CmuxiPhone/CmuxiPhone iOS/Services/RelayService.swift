@@ -297,6 +297,11 @@ final class RelayService: ObservableObject {
     /// reach (Tailscale/LAN). Used to rewrite localhost URLs printed by agents.
     var bridgeHost: String? { bridgeClient.baseURL?.host }
 
+    /// Authenticated streaming URL for a video file in a terminal's cwd.
+    func mediaURL(_ terminalId: String, path: String) -> URL? {
+        bridgeClient.mediaURL(terminalId: terminalId, path: path)
+    }
+
     /// Stand up (or reuse) a bridge-side forwarder for a localhost dev-server
     /// port; returns the proxy port to connect to on the bridge host.
     func openProxy(port: Int) async -> Int? {

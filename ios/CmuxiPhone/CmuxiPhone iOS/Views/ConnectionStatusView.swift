@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import PhotosUI
+import AVKit
 
 // MARK: - Navigation routes
 //
@@ -677,6 +678,11 @@ private struct DashStatusBadge: View {
 private func isImageName(_ name: String) -> Bool {
     let ext = (name as NSString).pathExtension.lowercased()
     return ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "tiff", "tif", "ico"].contains(ext)
+}
+
+private func isVideoName(_ name: String) -> Bool {
+    let ext = (name as NSString).pathExtension.lowercased()
+    return ["mp4", "m4v", "mov", "webm", "m3u8"].contains(ext)
 }
 
 /// Inline thumbnail for an image entry in a directory listing — fetches the image
@@ -1517,6 +1523,7 @@ private struct CmuxNodeScreen: View {
                 case .directory: directoryList(node)
                 case .file: fileContent(node)
                 case .image: imageContent(node)
+                case .video: videoContent(node)
                 }
             }
         }
@@ -1538,8 +1545,10 @@ private struct CmuxNodeScreen: View {
                         if !entry.isDir && isImageName(entry.name) {
                             DirThumb(terminalId: terminalId, path: entry.path)
                         } else {
-                            Image(systemName: entry.isDir ? "folder.fill" : "doc.text")
-                                .foregroundStyle(entry.isDir ? Color.claudeAmber : Color.subtleText)
+                            Image(systemName: entry.isDir ? "folder.fill"
+                                  : (isVideoName(entry.name) ? "film" : "doc.text"))
+                                .foregroundStyle(entry.isDir ? Color.claudeAmber
+                                                 : (isVideoName(entry.name) ? Color.claudeOrange : Color.subtleText))
                                 .frame(width: 28)
                         }
                         Text(entry.name)
@@ -1600,6 +1609,24 @@ private struct CmuxNodeScreen: View {
         }
     }
 
+    @ViewBuilder
+    private func videoContent(_ node: CmuxNode) -> some View {
+        if let url = relayService.mediaURL(terminalId, path: node.path) {
+            VideoStreamView(url: url)
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "film")
+                    .font(.system(size: 34))
+                    .foregroundStyle(Color.subtleText)
+                Text("영상을 재생할 수 없습니다")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color.textPrimary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+        }
+    }
+
     private func load() async {
         loading = true
         errorMessage = nil
@@ -1608,6 +1635,28 @@ private struct CmuxNodeScreen: View {
         case .failed(let msg): errorMessage = msg
         }
         loading = false
+    }
+}
+
+/// Streams a video from the bridge (Range-backed) with native playback controls.
+private struct VideoStreamView: View {
+    let url: URL
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        Group {
+            if let player {
+                VideoPlayer(player: player)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .background(Color.black)
+        .onAppear {
+            if player == nil { player = AVPlayer(url: url) }
+            player?.play()
+        }
+        .onDisappear { player?.pause() }
     }
 }
 
