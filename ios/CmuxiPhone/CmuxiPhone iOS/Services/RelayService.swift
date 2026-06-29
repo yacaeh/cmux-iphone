@@ -302,6 +302,11 @@ final class RelayService: ObservableObject {
         bridgeClient.mediaURL(terminalId: terminalId, path: path)
     }
 
+    /// Start a new agent session (cmux workspace) from the phone.
+    func newCmuxSession(cwd: String?, agent: String, name: String?) async -> Bool {
+        await bridgeClient.newCmuxSession(cwd: cwd, agent: agent, name: name)
+    }
+
     /// Stand up (or reuse) a bridge-side forwarder for a localhost dev-server
     /// port; returns the proxy port to connect to on the bridge host.
     func openProxy(port: Int) async -> Int? {

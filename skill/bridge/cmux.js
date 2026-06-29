@@ -231,6 +231,19 @@ export async function terminalCwd(id) {
   return null;
 }
 
+// Start a NEW agent session from the phone: create a cmux workspace in `cwd`
+// running the chosen agent (claude/codex). Runs via the in-cmux bridge (a cmux
+// descendant), so the new workspace lands in cmux and shows up in the mirror.
+export async function newSession({ cwd, agent, name } = {}) {
+  if (!CMUX_BIN) throw new Error("cmux binary not found");
+  const command = agent === "codex" ? "codex" : "claude";
+  const args = ["new-workspace", "--command", command, "--focus", "false"];
+  if (cwd) args.push("--cwd", cwd);
+  if (name) args.push("--name", name);
+  await cmux(args);
+  return true;
+}
+
 // Full workspace → terminal tree for the mobile mirror.
 // Returns the raw mobile.workspace.list payload (workspaces[].terminals[]).
 export async function mobileWorkspaces() {

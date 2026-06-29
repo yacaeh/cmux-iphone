@@ -364,6 +364,26 @@ final class BridgeClient {
         }
     }
 
+    /// Start a new agent session (cmux workspace) in `cwd` running `agent`.
+    func newCmuxSession(cwd: String?, agent: String, name: String?) async -> Bool {
+        guard let baseURL, let token else { return false }
+        let url = baseURL.appendingPathComponent("cmux/new-session")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = ["agent": agent]
+        if let cwd, !cwd.isEmpty { body["cwd"] = cwd }
+        if let name, !name.isEmpty { body["name"] = name }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        do {
+            let (_, response) = try await performRequest(request)
+            return (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
+        } catch {
+            return false
+        }
+    }
+
     /// Authenticated URL for streaming a media file (video) — token is in the
     /// query so AVPlayer (which can't set headers) can play it directly.
     func mediaURL(terminalId: String, path filePath: String) -> URL? {

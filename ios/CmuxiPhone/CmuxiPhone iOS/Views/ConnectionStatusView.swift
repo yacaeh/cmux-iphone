@@ -60,6 +60,7 @@ struct ConnectionStatusView: View {
     @State private var path = NavigationPath()
     @State private var showSettings = false
     @State private var showApprovalQueue = false
+    @State private var showNewSession = false
     @State private var renameTarget: SavedConnection?
     @State private var renameText = ""
     @State private var deleteTarget: SavedConnection?
@@ -97,6 +98,12 @@ struct ConnectionStatusView: View {
                     }
                 }
                 if relayService.cmuxAvailable {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { showNewSession = true } label: {
+                            Image(systemName: "plus.circle")
+                                .foregroundStyle(Color.claudeOrange)
+                        }
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
                             path.append(DashboardRoute())
@@ -139,6 +146,9 @@ struct ConnectionStatusView: View {
         }
         .sheet(isPresented: $showApprovalQueue) {
             ApprovalQueueView().environmentObject(relayService)
+        }
+        .sheet(isPresented: $showNewSession) {
+            NewSessionView().environmentObject(relayService)
         }
         .onChange(of: relayService.pendingApprovalCount) { oldCount, newCount in
             // Auto-present the approval card on ANY screen when a new one arrives
@@ -595,6 +605,99 @@ private struct WorkspacesView: View {
 }
 
 // MARK: - Level 3: Sessions in a folder — SCREEN 04
+
+// MARK: - cmux mirror: start a new agent session from the phone
+
+private struct NewSessionView: View {
+    @EnvironmentObject private var relayService: RelayService
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var agent = "claude"
+    @State private var cwd = ""
+    @State private var name = ""
+    @State private var busy = false
+    @State private var errorMessage: String?
+
+    // Distinct project dirs from the live mirror, as quick picks.
+    private var recentDirs: [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for w in relayService.cmuxWorkspaces {
+            if let c = w.cwd, !c.isEmpty, seen.insert(c).inserted { out.append(c) }
+        }
+        return out
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("에이전트") {
+                    Picker("에이전트", selection: $agent) {
+                        Text("Claude").tag("claude")
+                        Text("Codex").tag("codex")
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Section("작업 폴더 (비우면 기본 위치)") {
+                    TextField("/path/to/project", text: $cwd)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(size: 13, design: .monospaced))
+                    ForEach(recentDirs, id: \.self) { d in
+                        Button { cwd = d } label: {
+                            HStack {
+                                Image(systemName: "folder").foregroundStyle(Color.subtleText)
+                                Text(d).font(.system(size: 12, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                                Spacer()
+                                if cwd == d { Image(systemName: "checkmark").foregroundStyle(Color.claudeOrange) }
+                            }
+                        }
+                        .foregroundStyle(Color.textPrimary)
+                    }
+                }
+                Section("이름 (선택)") {
+                    TextField("세션 이름", text: $name)
+                }
+                if let errorMessage {
+                    Text(errorMessage).font(.system(size: 13)).foregroundStyle(Color.denyRed)
+                }
+            }
+            .navigationTitle("새 세션 시작")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("취소") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if busy {
+                        ProgressView()
+                    } else {
+                        Button("시작") { start() }.bold()
+                    }
+                }
+            }
+        }
+    }
+
+    private func start() {
+        busy = true
+        errorMessage = nil
+        Task {
+            let ok = await relayService.newCmuxSession(
+                cwd: cwd.trimmingCharacters(in: .whitespaces),
+                agent: agent,
+                name: name.trimmingCharacters(in: .whitespaces)
+            )
+            busy = false
+            if ok {
+                relayService.refreshCmuxTree()
+                dismiss()
+            } else {
+                errorMessage = "세션을 만들지 못했습니다 (경로 확인)"
+            }
+        }
+    }
+}
 
 // MARK: - cmux mirror: cross-workspace session dashboard
 

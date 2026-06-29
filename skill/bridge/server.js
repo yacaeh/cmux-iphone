@@ -2203,6 +2203,32 @@ async function handleCmuxMedia(req, res) {
   fs.createReadStream(rp).on("error", () => res.destroy()).pipe(res);
 }
 
+// POST /cmux/new-session — start a new agent session from the phone. Body:
+// { cwd?, agent: "claude"|"codex", name? }. Creates a cmux workspace running the
+// agent; it then appears in the mirror. cwd (if given) must be an existing dir.
+async function handleCmuxNewSession(req, res) {
+  if (req.method !== "POST") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  let body;
+  try { body = await readBody(req); } catch { return jsonResponse(res, 400, { error: "bad-body" }); }
+  const agent = body.agent === "codex" ? "codex" : "claude";
+  const cwd = typeof body.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : null;
+  const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : null;
+  if (cwd) {
+    try {
+      const st = await fs.promises.stat(cwd);
+      if (!st.isDirectory()) return jsonResponse(res, 400, { error: "cwd-not-a-directory" });
+    } catch { return jsonResponse(res, 400, { error: "cwd-not-found" }); }
+  }
+  try {
+    await cmux.newSession({ cwd, agent, name });
+    return jsonResponse(res, 200, { ok: true });
+  } catch (e) {
+    return jsonResponse(res, 500, { error: "create-failed" });
+  }
+}
+
 // GET /cmux/statuses — per-terminal run state for the dashboard. The cmux tree
 // only exposes is_ready (always true), so "running" is detected from the live
 // VISIBLE screen: vanilla Claude/Codex show "esc to interrupt" while generating;
@@ -2389,6 +2415,7 @@ const routes = {
   "GET /cmux/media": handleCmuxMedia,
   "HEAD /cmux/media": handleCmuxMedia,
   "GET /cmux/statuses": handleCmuxStatuses,
+  "POST /cmux/new-session": handleCmuxNewSession,
   "GET /proxy/open": handleProxyOpen,
   "POST /cmux/upload": handleCmuxUpload,
 };
