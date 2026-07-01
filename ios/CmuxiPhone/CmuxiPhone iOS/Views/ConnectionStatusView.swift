@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import PhotosUI
 import AVKit
+import WebKit
 
 // MARK: - Navigation routes
 //
@@ -786,6 +787,31 @@ private func isImageName(_ name: String) -> Bool {
 private func isVideoName(_ name: String) -> Bool {
     let ext = (name as NSString).pathExtension.lowercased()
     return ["mp4", "m4v", "mov", "webm", "m3u8"].contains(ext)
+}
+
+private func isHTMLName(_ name: String) -> Bool {
+    let ext = (name as NSString).pathExtension.lowercased()
+    return ext == "html" || ext == "htm"
+}
+
+/// Renders an HTML string as a web page (WKWebView).
+private struct WebPreview: UIViewRepresentable {
+    let html: String
+    func makeUIView(context: Context) -> WKWebView {
+        let wv = WKWebView()
+        wv.isOpaque = false
+        wv.backgroundColor = .black
+        wv.scrollView.backgroundColor = .black
+        return wv
+    }
+    func updateUIView(_ wv: WKWebView, context: Context) {
+        if context.coordinator.lastHTML != html {
+            context.coordinator.lastHTML = html
+            wv.loadHTMLString(html, baseURL: nil)
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator { var lastHTML: String? }
 }
 
 /// Inline thumbnail for an image entry in a directory listing — fetches the image
@@ -1723,6 +1749,7 @@ private struct CmuxNodeScreen: View {
     @State private var node: CmuxNode? = nil
     @State private var errorMessage: String? = nil
     @State private var loading = true
+    @State private var showSource = false
 
     var body: some View {
         Group {
@@ -1792,22 +1819,49 @@ private struct CmuxNodeScreen: View {
 
     @ViewBuilder
     private func fileContent(_ node: CmuxNode) -> some View {
-        ScrollView([.vertical, .horizontal]) {
-            Text(node.content.isEmpty ? "(빈 파일)" : node.content)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(Color.textPrimary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: true, vertical: true)
-                .padding(12)
-        }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if node.truncated {
-                Text("일부만 표시 (큰 파일)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.claudeAmber)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12).padding(.vertical, 4)
+        if isHTMLName(node.name) && !showSource {
+            // Render HTML as a web page (self-contained/inline-asset HTML renders;
+            // externally-referenced relative assets won't load).
+            WebPreview(html: node.content)
+                .ignoresSafeArea(edges: .bottom)
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    HStack {
+                        if node.truncated {
+                            Text("일부만 표시 (큰 파일)")
+                                .font(.system(size: 11)).foregroundStyle(Color.claudeAmber)
+                        }
+                        Spacer()
+                        Button("소스 보기") { showSource = true }
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.claudeOrange)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Color.surfaceElevated)
+                }
+        } else {
+            ScrollView([.vertical, .horizontal]) {
+                Text(node.content.isEmpty ? "(빈 파일)" : node.content)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Color.textPrimary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(12)
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HStack {
+                    if node.truncated {
+                        Text("일부만 표시 (큰 파일)")
+                            .font(.system(size: 11)).foregroundStyle(Color.claudeAmber)
+                    }
+                    Spacer()
+                    if isHTMLName(node.name) {
+                        Button("미리보기") { showSource = false }
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.claudeOrange)
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(Color.surfaceElevated)
             }
         }
     }
