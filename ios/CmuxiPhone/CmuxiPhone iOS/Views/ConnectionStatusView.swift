@@ -1036,6 +1036,7 @@ private struct CmuxTerminalView: View {
     @State private var showImageSource = false
     @State private var uploadingImage = false
     @State private var uploadError: String? = nil
+    @State private var showSnippets = false
     @State private var showModelSheet = false
     @State private var codexDriving = false
     @State private var codexStatus = ""
@@ -1529,13 +1530,20 @@ private struct CmuxTerminalView: View {
     }
 
     private var inputBar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
+            // Snippets — frequently-used commands + directory jumps.
+            Button { showSnippets = true } label: {
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Color.claudeOrange)
+                    .frame(width: 34, height: 38)
+            }
             // Attach a photo/screenshot → uploads to cwd, inserts the path.
             Button { showImageSource = true } label: {
                 Image(systemName: uploadingImage ? "ellipsis" : "photo")
                     .font(.system(size: 18))
                     .foregroundStyle(uploadingImage ? Color.subtleText : Color.claudeOrange)
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 38)
             }
             .disabled(uploadingImage)
 
@@ -1589,6 +1597,40 @@ private struct CmuxTerminalView: View {
         )) {
             Button("확인", role: .cancel) {}
         } message: { Text(uploadError ?? "") }
+        .sheet(isPresented: $showSnippets) {
+            SnippetSheet(
+                dirs: dirSnippets,
+                onInsert: { insertSnippet($0) },
+                onSend: { sendSnippet($0) }
+            )
+        }
+    }
+
+    // Every distinct path in the current cmux mirror → a "cd <path>" snippet.
+    private var dirSnippets: [PromptSnippet] {
+        var seen = Set<String>()
+        var out: [PromptSnippet] = []
+        for w in relayService.cmuxWorkspaces {
+            if let c = w.cwd, !c.isEmpty, seen.insert(c).inserted {
+                out.append(PromptSnippet(label: w.title, text: "cd \(c)"))
+            }
+            for t in w.terminals {
+                if let c = t.cwd, !c.isEmpty, seen.insert(c).inserted {
+                    out.append(PromptSnippet(label: t.title, text: "cd \(c)"))
+                }
+            }
+        }
+        return out
+    }
+
+    private func insertSnippet(_ text: String) {
+        promptText = promptText.isEmpty ? text : promptText + " " + text
+        inputFocused = true
+    }
+
+    private func sendSnippet(_ text: String) {
+        relayService.sendCmux(terminalId: terminalId, text: text)
+        Task { try? await Task.sleep(nanoseconds: 400_000_000); await refresh() }
     }
 
     // Compress + downscale an image and upload it; on success insert the saved
@@ -1887,6 +1929,167 @@ private struct SelectableTerminalText: UIViewRepresentable {
                       in characterRange: NSRange, interaction: UITextItemInteraction) -> Bool {
             onLink(URL)
             return false
+        }
+    }
+}
+
+// MARK: - Prompt snippets (frequently-used commands + directory jumps)
+
+struct PromptSnippet: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var label: String
+    var text: String
+}
+
+/// Persisted, user-editable command snippets. Directory snippets are generated
+/// live from the cmux session tree, not stored here.
+final class SnippetStore: ObservableObject {
+    static let shared = SnippetStore()
+    @Published var snippets: [PromptSnippet] = []
+    private let key = "cmux_prompt_snippets_v1"
+
+    private init() {
+        if let data = UserDefaults.standard.data(forKey: key),
+           let arr = try? JSONDecoder().decode([PromptSnippet].self, from: data) {
+            snippets = arr
+        } else {
+            snippets = Self.defaults
+            save()
+        }
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(snippets) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+    func add(_ s: PromptSnippet) { snippets.append(s); save() }
+    func update(_ s: PromptSnippet) {
+        if let i = snippets.firstIndex(where: { $0.id == s.id }) { snippets[i] = s; save() }
+    }
+    func delete(at offsets: IndexSet) { snippets.remove(atOffsets: offsets); save() }
+
+    static let defaults: [PromptSnippet] = [
+        .init(label: "가재코드", text: "gjc --tmux"),
+        .init(label: "omo (madmax)", text: "omx --madmax --high"),
+        .init(label: "/clear", text: "/clear"),
+        .init(label: "/compact", text: "/compact"),
+        .init(label: "/model", text: "/model"),
+        .init(label: "/cost", text: "/cost"),
+        .init(label: "/resume", text: "/resume"),
+        .init(label: "git status", text: "git status"),
+        .init(label: "계속 진행", text: "계속 진행해줘"),
+    ]
+}
+
+/// Snippet picker: tap a row to insert into the prompt, ✈︎ to send immediately.
+/// Command snippets are editable; the directory section is live from the mirror.
+private struct SnippetSheet: View {
+    @ObservedObject private var store = SnippetStore.shared
+    let dirs: [PromptSnippet]
+    let onInsert: (String) -> Void
+    let onSend: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var editing: PromptSnippet?
+    @State private var adding = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("명령") {
+                    ForEach(store.snippets) { s in
+                        row(s, editable: true)
+                    }
+                    .onDelete { store.delete(at: $0) }
+                }
+                if !dirs.isEmpty {
+                    Section("디렉토리 이동 (현재 세션 경로)") {
+                        ForEach(dirs) { s in row(s, editable: false) }
+                    }
+                }
+            }
+            .navigationTitle("스니펫")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("닫기") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { adding = true } label: { Image(systemName: "plus") }
+                }
+            }
+            .sheet(isPresented: $adding) {
+                SnippetEditor(existing: nil) { label, text in
+                    store.add(PromptSnippet(label: label, text: text))
+                }
+            }
+            .sheet(item: $editing) { s in
+                SnippetEditor(existing: s) { label, text in
+                    store.update(PromptSnippet(id: s.id, label: label, text: text))
+                }
+            }
+        }
+    }
+
+    private func row(_ s: PromptSnippet, editable: Bool) -> some View {
+        HStack(spacing: 10) {
+            Button { onInsert(s.text); dismiss() } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(s.label).font(.system(size: 14, weight: .medium)).foregroundStyle(Color.textPrimary)
+                    Text(s.text).font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color.subtleText).lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 6)
+            Button { onSend(s.text); dismiss() } label: {
+                Image(systemName: "paperplane.fill").foregroundStyle(Color.claudeOrange)
+            }
+            .buttonStyle(.plain)
+        }
+        .contentShape(Rectangle())
+        .contextMenu {
+            if editable {
+                Button("편집") { editing = s }
+            }
+            Button("입력창에 넣기") { onInsert(s.text); dismiss() }
+            Button("바로 실행") { onSend(s.text); dismiss() }
+        }
+    }
+}
+
+private struct SnippetEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var label: String
+    @State private var text: String
+    let onSave: (String, String) -> Void
+
+    init(existing: PromptSnippet?, onSave: @escaping (String, String) -> Void) {
+        _label = State(initialValue: existing?.label ?? "")
+        _text = State(initialValue: existing?.text ?? "")
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("이름") { TextField("예: 가재코드", text: $label) }
+                Section("명령/텍스트") {
+                    TextField("예: gjc --tmux", text: $text, axis: .vertical)
+                        .font(.system(size: 14, design: .monospaced))
+                        .lineLimit(1...5)
+                }
+            }
+            .navigationTitle("스니펫")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("취소") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("저장") {
+                        let l = label.trimmingCharacters(in: .whitespaces)
+                        let t = text.trimmingCharacters(in: .whitespaces)
+                        if !t.isEmpty { onSave(l.isEmpty ? t : l, t); dismiss() }
+                    }.bold()
+                }
+            }
         }
     }
 }
