@@ -1024,6 +1024,9 @@ private struct CmuxTerminalView: View {
     /// Cached colored render — rebuilt only when the screen changes (not on every
     /// keystroke), so typing in the prompt stays snappy.
     @State private var rendered: AttributedString? = nil
+    /// NSAttributedString variant for the selectable UITextView (native text
+    /// selection + copy).
+    @State private var renderedNS: NSAttributedString? = nil
     @State private var promptText: String = ""
     @State private var sending = false
     @State private var browseTarget: BrowseTarget? = nil
@@ -1089,23 +1092,8 @@ private struct CmuxTerminalView: View {
         .animation(.spring(response: 0.25, dampingFraction: 0.85), value: showModelSheet)
         // Tapping a file path in the terminal opens it (scoped to the cwd).
         .environment(\.openURL, OpenURLAction { url in
-            if url.scheme == "cmuxfile" {
-                let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                    .queryItems?.first(where: { $0.name == "p" })?.value
-                if let p, !p.isEmpty { browseTarget = BrowseTarget(path: p) }
-                return .handled
-            }
-            if url.scheme == "http" || url.scheme == "https" {
-                // localhost dev URLs aren't reachable from the phone — route them
-                // through a bridge-side TCP proxy (works even for 127.0.0.1-only
-                // servers); non-localhost URLs open directly in the browser.
-                if isLocalhost(url) {
-                    openViaProxy(url)
-                    return .handled
-                }
-                return .systemAction
-            }
-            return .systemAction
+            handleTerminalURL(url)
+            return .handled
         })
         .sheet(item: $browseTarget) { t in
             CmuxBrowser(terminalId: terminalId, rootPath: t.path)
@@ -1133,8 +1121,10 @@ private struct CmuxTerminalView: View {
             styledScreen = s.styled
             if let st = s.styled, !st.lines.isEmpty {
                 rendered = Self.attributedScreen(st)
+                renderedNS = Self.terminalNSAttributed(st)
             } else {
                 rendered = nil
+                renderedNS = nil
             }
         }
     }
@@ -1253,20 +1243,30 @@ private struct CmuxTerminalView: View {
 
             Rectangle().fill(Color.hairline).frame(height: 1)
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    terminalScreen
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(12)
-                    Color.clear.frame(height: 1).id("bottom")
-                }
-                .onChange(of: screen) { _, _ in
-                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            if let renderedNS {
+                // Native selectable terminal: drag-select any range → Copy.
+                SelectableTerminalText(
+                    attributed: renderedNS,
+                    background: UIColor(hexString: styledScreen?.bg ?? "1E1E1E") ?? .black,
+                    onLink: { handleTerminalURL($0) }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        terminalScreen
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(12)
+                        Color.clear.frame(height: 1).id("bottom")
+                    }
+                    .onChange(of: screen) { _, _ in
+                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    }
                 }
             }
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(terminalBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.hairline, lineWidth: 1))
@@ -1374,6 +1374,70 @@ private struct CmuxTerminalView: View {
         piece[aLo..<aHi].foregroundColor = color
     }
 
+    // NSAttributedString variant (for the selectable UITextView): same colors +
+    // links as attributedScreen, built as an NSAttributedString UIKit can select.
+    private static func terminalNSAttributed(_ styled: CmuxStyledScreen) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let size: CGFloat = 12
+        let defaultFg = UIColor(hexString: styled.fg) ?? .white
+        let lineCount = styled.lines.count
+        for (i, line) in styled.lines.enumerated() {
+            for run in line {
+                let st = styled.style(run.styleId)
+                let font = UIFont.monospacedSystemFont(ofSize: size, weight: st?.bold == true ? .bold : .regular)
+                let inverse = st?.inverse == true
+                let fgHex = inverse ? st?.bg : st?.fg
+                var fg = fgHex.flatMap { UIColor(hexString: $0) } ?? defaultFg
+                if st?.faint == true { fg = fg.withAlphaComponent(0.6) }
+                var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: fg]
+                if inverse, let bg = (st?.fg).flatMap({ UIColor(hexString: $0) }) {
+                    attrs[.backgroundColor] = bg
+                } else if let bgHex = st?.bg, bgHex != styled.bg, let bg = UIColor(hexString: bgHex) {
+                    attrs[.backgroundColor] = bg
+                }
+                if st?.underline == true { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+                if st?.strike == true { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+                let piece = NSMutableAttributedString(string: run.text, attributes: attrs)
+                nsLinkify(piece, in: run.text)
+                out.append(piece)
+            }
+            if i < lineCount - 1 { out.append(NSAttributedString(string: "\n")) }
+        }
+        return out
+    }
+
+    // Set .link on URL/path substrings within one NS run (URLs win over paths).
+    private static func nsLinkify(_ piece: NSMutableAttributedString, in text: String) {
+        var urlRanges: [Range<String.Index>] = []
+        for match in text.matches(of: urlRegex) {
+            var s = String(text[match.range])
+            var trimmed = 0
+            while let last = s.last, ".,;:!?)]}>\"'".contains(last) { s.removeLast(); trimmed += 1 }
+            guard !s.isEmpty, let url = URL(string: s) else { continue }
+            let upper = text.index(match.range.upperBound, offsetBy: -trimmed)
+            let r = match.range.lowerBound..<upper
+            urlRanges.append(r)
+            nsApplyLink(piece, text: text, range: r, url: url, color: UIColor(red: 0.35, green: 0.66, blue: 1, alpha: 1))
+        }
+        for match in text.matches(of: pathRegex) {
+            if urlRanges.contains(where: { $0.overlaps(match.range) }) { continue }
+            let raw = String(text[match.range])
+            var allowed = CharacterSet.urlQueryAllowed
+            allowed.remove(charactersIn: "&=?+#")
+            guard let enc = raw.addingPercentEncoding(withAllowedCharacters: allowed),
+                  let url = URL(string: "cmuxfile://f?p=\(enc)") else { continue }
+            nsApplyLink(piece, text: text, range: match.range, url: url, color: UIColor(red: 0.93, green: 0.49, blue: 0.22, alpha: 1))
+        }
+    }
+
+    private static func nsApplyLink(_ piece: NSMutableAttributedString, text: String,
+                                    range: Range<String.Index>, url: URL, color: UIColor) {
+        let ns = NSRange(range, in: text)
+        guard ns.location != NSNotFound, ns.length > 0, ns.location + ns.length <= piece.length else { return }
+        piece.addAttributes([.link: url, .underlineStyle: NSUnderlineStyle.single.rawValue,
+                             .foregroundColor: color], range: ns)
+    }
+
     // Quick special-key bar — interrupt a running agent (취소 = Ctrl-C), Esc, Tab,
     // arrows, Enter. Sends raw key sequences straight to the terminal.
     private var specialKeyBar: some View {
@@ -1412,6 +1476,19 @@ private struct CmuxTerminalView: View {
             await relayService.sendCmuxKey(terminalId: terminalId, key: key)
             try? await Task.sleep(nanoseconds: 200_000_000)
             await refresh()
+        }
+    }
+
+    // Route a tapped terminal link: cmuxfile → file/dir browser; localhost http →
+    // bridge proxy; other http(s) → the browser.
+    private func handleTerminalURL(_ url: URL) {
+        if url.scheme == "cmuxfile" {
+            let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "p" })?.value
+            if let p, !p.isEmpty { browseTarget = BrowseTarget(path: p) }
+        } else if url.scheme == "http" || url.scheme == "https" {
+            if isLocalhost(url) { openViaProxy(url) }
+            else { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
         }
     }
 
@@ -1738,6 +1815,79 @@ private struct CmuxNodeScreen: View {
         case .failed(let msg): errorMessage = msg
         }
         loading = false
+    }
+}
+
+private extension UIColor {
+    convenience init?(hexString: String) {
+        var s = hexString.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+        guard let v = UInt64(s, radix: 16) else { return nil }
+        let r, g, b, a: CGFloat
+        switch s.count {
+        case 6:
+            r = CGFloat((v >> 16) & 0xFF) / 255; g = CGFloat((v >> 8) & 0xFF) / 255
+            b = CGFloat(v & 0xFF) / 255; a = 1
+        case 8:
+            r = CGFloat((v >> 24) & 0xFF) / 255; g = CGFloat((v >> 16) & 0xFF) / 255
+            b = CGFloat((v >> 8) & 0xFF) / 255; a = CGFloat(v & 0xFF) / 255
+        default:
+            return nil
+        }
+        self.init(red: r, green: g, blue: b, alpha: a)
+    }
+}
+
+/// Native selectable terminal screen (UITextView) — drag-select any range and
+/// Copy, while file/URL links stay tappable. Auto-scrolls to the bottom on new
+/// output unless the user has a selection active.
+private struct SelectableTerminalText: UIViewRepresentable {
+    let attributed: NSAttributedString
+    let background: UIColor
+    let onLink: (URL) -> Void
+
+    func makeUIView(context: Context) -> UITextView {
+        let tv = UITextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.backgroundColor = background
+        tv.textContainerInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        tv.dataDetectorTypes = []
+        tv.delegate = context.coordinator
+        tv.alwaysBounceVertical = true
+        // Fill the offered height and scroll internally (don't grow to content).
+        tv.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        tv.setContentHuggingPriority(.defaultLow, for: .vertical)
+        tv.attributedText = attributed
+        return tv
+    }
+
+    func updateUIView(_ tv: UITextView, context: Context) {
+        // Only reset text when it actually changed, so a live poll doesn't clobber
+        // an in-progress selection. Auto-scroll to bottom on new output.
+        if tv.attributedText?.string != attributed.string {
+            let hadSelection = tv.selectedRange.length > 0
+            tv.attributedText = attributed
+            tv.backgroundColor = background
+            if !hadSelection {
+                DispatchQueue.main.async {
+                    tv.scrollRangeToVisible(NSRange(location: max(0, attributed.length - 1), length: 0))
+                }
+            }
+        } else if tv.backgroundColor != background {
+            tv.backgroundColor = background
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onLink: onLink) }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        let onLink: (URL) -> Void
+        init(onLink: @escaping (URL) -> Void) { self.onLink = onLink }
+        func textView(_ textView: UITextView, shouldInteractWith URL: URL,
+                      in characterRange: NSRange, interaction: UITextItemInteraction) -> Bool {
+            onLink(URL)
+            return false
+        }
     }
 }
 
