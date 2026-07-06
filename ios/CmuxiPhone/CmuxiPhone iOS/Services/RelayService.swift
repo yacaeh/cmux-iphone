@@ -302,6 +302,11 @@ final class RelayService: ObservableObject {
         bridgeClient.mediaURL(terminalId: terminalId, path: path)
     }
 
+    /// URL rendering a markdown file as HTML (bridge-side, full content).
+    func mdviewURL(_ terminalId: String, path: String) -> URL? {
+        bridgeClient.mdviewURL(terminalId: terminalId, path: path)
+    }
+
     /// Start a new agent session (cmux workspace) from the phone.
     func newCmuxSession(cwd: String?, agent: String, name: String?) async -> Bool {
         await bridgeClient.newCmuxSession(cwd: cwd, agent: agent, name: name)

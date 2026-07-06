@@ -794,9 +794,21 @@ private func isHTMLName(_ name: String) -> Bool {
     return ext == "html" || ext == "htm"
 }
 
-/// Renders an HTML string as a web page (WKWebView).
+private func isMarkdownName(_ name: String) -> Bool {
+    let ext = (name as NSString).pathExtension.lowercased()
+    return ext == "md" || ext == "markdown"
+}
+
+/// Renders HTML in a WKWebView — either an inline string or a URL. URL mode
+/// streams the FULL file from the bridge (inline content is capped at 512KB by
+/// /cmux/file, which blanks out big HTML).
 private struct WebPreview: UIViewRepresentable {
-    let html: String
+    enum Source: Equatable { case html(String), url(URL) }
+    let source: Source
+
+    init(html: String) { self.source = .html(html) }
+    init(url: URL) { self.source = .url(url) }
+
     func makeUIView(context: Context) -> WKWebView {
         let wv = WKWebView()
         wv.isOpaque = false
@@ -805,13 +817,15 @@ private struct WebPreview: UIViewRepresentable {
         return wv
     }
     func updateUIView(_ wv: WKWebView, context: Context) {
-        if context.coordinator.lastHTML != html {
-            context.coordinator.lastHTML = html
-            wv.loadHTMLString(html, baseURL: nil)
+        guard context.coordinator.last != source else { return }
+        context.coordinator.last = source
+        switch source {
+        case .html(let s): wv.loadHTMLString(s, baseURL: nil)
+        case .url(let u): wv.load(URLRequest(url: u))
         }
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator { var lastHTML: String? }
+    final class Coordinator { var last: Source? }
 }
 
 /// Inline thumbnail for an image entry in a directory listing — fetches the image
@@ -1819,25 +1833,29 @@ private struct CmuxNodeScreen: View {
 
     @ViewBuilder
     private func fileContent(_ node: CmuxNode) -> some View {
-        if isHTMLName(node.name) && !showSource {
-            // Render HTML as a web page (self-contained/inline-asset HTML renders;
-            // externally-referenced relative assets won't load).
-            WebPreview(html: node.content)
-                .ignoresSafeArea(edges: .bottom)
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    HStack {
-                        if node.truncated {
-                            Text("일부만 표시 (큰 파일)")
-                                .font(.system(size: 11)).foregroundStyle(Color.claudeAmber)
-                        }
-                        Spacer()
-                        Button("소스 보기") { showSource = true }
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color.claudeOrange)
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(Color.surfaceElevated)
+        if (isHTMLName(node.name) || isMarkdownName(node.name)) && !showSource {
+            // HTML: stream the FULL file from the bridge (inline content is capped
+            // at 512KB and truncated HTML blanks out). MD: bridge-rendered page.
+            Group {
+                if isMarkdownName(node.name), let u = relayService.mdviewURL(terminalId, path: node.path) {
+                    WebPreview(url: u)
+                } else if isHTMLName(node.name), let u = relayService.mediaURL(terminalId, path: node.path) {
+                    WebPreview(url: u)
+                } else {
+                    WebPreview(html: node.content)
                 }
+            }
+            .ignoresSafeArea(edges: .bottom)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HStack {
+                    Spacer()
+                    Button("소스 보기") { showSource = true }
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.claudeOrange)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(Color.surfaceElevated)
+            }
         } else {
             ScrollView([.vertical, .horizontal]) {
                 Text(node.content.isEmpty ? "(빈 파일)" : node.content)
@@ -1854,7 +1872,7 @@ private struct CmuxNodeScreen: View {
                             .font(.system(size: 11)).foregroundStyle(Color.claudeAmber)
                     }
                     Spacer()
-                    if isHTMLName(node.name) {
+                    if isHTMLName(node.name) || isMarkdownName(node.name) {
                         Button("미리보기") { showSource = false }
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(Color.claudeOrange)

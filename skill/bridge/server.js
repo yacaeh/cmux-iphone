@@ -1965,6 +1965,16 @@ const CMUX_VIDEO_EXT = {
   ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
   ".webm": "video/webm", ".m3u8": "application/vnd.apple.mpegurl",
 };
+// /cmux/media also serves these so the phone can load FULL files (a WKWebView
+// can't render HTML truncated at the 512KB /cmux/file cap — it goes blank).
+const CMUX_MEDIA_MIME = {
+  ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8", ".markdown": "text/markdown; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8", ".json": "application/json; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8", ".xml": "text/xml; charset=utf-8",
+  ".svg": "image/svg+xml", ".pdf": "application/pdf",
+};
 
 // Sensitive directories/files the phone must never read, even though the Mac user
 // can. Matched against BOTH the resolved path and its realpath (defeats symlinks).
@@ -2174,7 +2184,9 @@ async function handleCmuxMedia(req, res) {
   try { st = await fs.promises.stat(rp); } catch { return jsonResponse(res, 404, { error: "not-found" }); }
   if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
 
-  const mime = CMUX_VIDEO_EXT[path.extname(rp).toLowerCase()] || "application/octet-stream";
+  const ext = path.extname(rp).toLowerCase();
+  const mime = CMUX_VIDEO_EXT[ext] || CMUX_MEDIA_MIME[ext] || CMUX_IMAGE_EXT[ext]
+    || "application/octet-stream";
   const total = st.size;
   const range = req.headers.range;
   const baseHeaders = { "Content-Type": mime, "Accept-Ranges": "bytes" };
@@ -2227,6 +2239,65 @@ async function handleCmuxNewSession(req, res) {
   } catch (e) {
     return jsonResponse(res, 500, { error: "create-failed" });
   }
+}
+
+// GET /cmux/mdview?id&path[&token] — serve a markdown file as a rendered HTML
+// page (dark-themed, marked.js from CDN, <pre> fallback if the CDN is
+// unreachable). Full file content — no 512KB /cmux/file truncation.
+const CMUX_MD_MAX = 4 * 1024 * 1024; // 4 MB
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+async function handleCmuxMdview(req, res) {
+  if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  const id = url.searchParams.get("id");
+  const rel = url.searchParams.get("path");
+  if (!id || !rel) return jsonResponse(res, 400, { error: "Missing id or path" });
+
+  const cwd = await cmux.terminalCwd(id);
+  if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
+  let target, rp;
+  try {
+    const base = path.resolve(cwd);
+    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
+    rp = await fs.promises.realpath(target);
+  } catch {
+    return jsonResponse(res, 404, { error: "not-found" });
+  }
+  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) {
+    return jsonResponse(res, 403, { error: "denied" });
+  }
+  let md;
+  try {
+    const st = await fs.promises.stat(rp);
+    if (!st.isFile() || st.size > CMUX_MD_MAX) return jsonResponse(res, 415, { error: "too-large" });
+    md = await fs.promises.readFile(rp, "utf8");
+  } catch {
+    return jsonResponse(res, 404, { error: "not-found" });
+  }
+
+  const page = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;margin:16px;background:#0f0f10;color:#ececec;line-height:1.6;word-wrap:break-word}
+pre{background:#1c1c1e;border-radius:8px;padding:12px;overflow-x:auto}
+code{background:#1c1c1e;border-radius:4px;padding:2px 5px;font-family:ui-monospace,Menlo,monospace;font-size:.88em}
+pre code{padding:0;background:none}
+a{color:#5aa9ff} img{max-width:100%;border-radius:6px}
+table{border-collapse:collapse;display:block;overflow-x:auto} td,th{border:1px solid #333;padding:5px 10px}
+h1,h2{border-bottom:1px solid #2a2a2c;padding-bottom:5px}
+blockquote{border-left:3px solid #444;margin-left:0;padding-left:12px;color:#b8b8b8}
+hr{border:none;border-top:1px solid #2a2a2c}
+</style></head><body>
+<div id="c"><pre style="white-space:pre-wrap">${escapeHtml(md)}</pre></div>
+<script>window.__md=${JSON.stringify(md).replace(/</g, "\\u003c")};<\/script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"
+ onload="document.getElementById('c').innerHTML=marked.parse(window.__md)"><\/script>
+</body></html>`;
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  return res.end(page);
 }
 
 // GET /cmux/statuses — per-terminal run state for the dashboard. The cmux tree
@@ -2414,6 +2485,7 @@ const routes = {
   "GET /cmux/file": handleCmuxFile,
   "GET /cmux/media": handleCmuxMedia,
   "HEAD /cmux/media": handleCmuxMedia,
+  "GET /cmux/mdview": handleCmuxMdview,
   "GET /cmux/statuses": handleCmuxStatuses,
   "POST /cmux/new-session": handleCmuxNewSession,
   "GET /proxy/open": handleProxyOpen,

@@ -364,6 +364,18 @@ final class BridgeClient {
         }
     }
 
+    /// Authenticated URL that renders a markdown file as a dark-themed HTML page.
+    func mdviewURL(terminalId: String, path filePath: String) -> URL? {
+        guard let baseURL, let token else { return nil }
+        var comps = URLComponents(url: baseURL.appendingPathComponent("cmux/mdview"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: terminalId),
+            URLQueryItem(name: "path", value: filePath),
+            URLQueryItem(name: "token", value: token),
+        ]
+        return comps?.url
+    }
+
     /// Start a new agent session (cmux workspace) in `cwd` running `agent`.
     func newCmuxSession(cwd: String?, agent: String, name: String?) async -> Bool {
         guard let baseURL, let token else { return false }
