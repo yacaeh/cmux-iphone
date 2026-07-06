@@ -300,27 +300,29 @@ function spansToStyledLines(spans) {
   const lines = [];
   for (let r = 0; r <= maxRow; r++) {
     const rs = byRow.get(r);
-    if (!rs) { lines.push([]); continue; }
+    if (!rs) { lines.push({ runs: [], width: 0 }); continue; }
     rs.sort((a, b) => (a.column || 0) - (b.column || 0));
     const runs = [];
+    const widths = []; // per-run cell width, parallel to runs
     let cell = 0; // current position in CELL units
     for (const s of rs) {
       const col = s.column || 0;
-      if (col > cell) { runs.push({ t: " ".repeat(col - cell), s: 0 }); cell = col; }
+      if (col > cell) { runs.push({ t: " ".repeat(col - cell), s: 0 }); widths.push(col - cell); cell = col; }
       const text = s.text || "";
-      if (text) runs.push({ t: text, s: typeof s.style_id === "number" ? s.style_id : 0 });
+      const w = typeof s.cell_width === "number" ? s.cell_width : text.length;
+      if (text) { runs.push({ t: text, s: typeof s.style_id === "number" ? s.style_id : 0 }); widths.push(w); }
       // advance by the span's cell width (CJK-aware), not the string length
-      cell += typeof s.cell_width === "number" ? s.cell_width : text.length;
+      cell += w;
     }
     // drop a trailing whitespace-only run (mirrors plain-text trailing trim)
-    while (runs.length && runs[runs.length - 1].t.trim() === "") runs.pop();
-    lines.push(runs);
+    while (runs.length && runs[runs.length - 1].t.trim() === "") { runs.pop(); cell -= widths.pop(); }
+    lines.push({ runs, width: cell });
   }
   return lines;
 }
 
 function styledLineIsEmpty(line) {
-  return !line.some((run) => run.t.trim() !== "");
+  return !line.runs.some((run) => run.t.trim() !== "");
 }
 
 // VISIBLE rows only (current viewport) — no scrollback. Used to detect a live
@@ -385,20 +387,25 @@ export async function readTerminalStyled(id) {
     for (const ln of lines) {
       if (styledLineIsEmpty(ln)) {
         blanks++;
-        if (blanks <= 2) collapsed.push([]);
+        if (blanks <= 2) collapsed.push({ runs: [], width: 0 });
       } else {
         blanks = 0;
         collapsed.push(ln);
       }
     }
-    lines = collapsed.slice(-400);
+    const tail = collapsed.slice(-400);
     const def = styles[0] || {};
+    const cols = rg.columns || 0;
+    // wraps[i] = row i is completely full → its text visually continues on row
+    // i+1 (soft wrap). Lets the phone re-join wrapped paths/URLs for links.
+    const wraps = tail.map((p, i) => cols > 0 && p.width >= cols && i < tail.length - 1);
     return {
-      cols: rg.columns || 0,
+      cols,
       bg: def.background || "#1E1E1E",
       fg: def.foreground || "#FFFFFF",
       palette,
-      lines,
+      lines: tail.map((p) => p.runs),
+      wraps,
     };
   } catch {
     return null;

@@ -38,6 +38,9 @@ struct CmuxStyledScreen {
     let fg: String
     let palette: [CmuxStyle]
     let lines: [[CmuxRun]]
+    /// wraps[i] == true → line i is a completely full row whose text soft-wraps
+    /// onto line i+1 (used to re-join wrapped paths/URLs for tappable links).
+    let wraps: [Bool]
 
     func style(_ id: Int) -> CmuxStyle? {
         (id >= 0 && id < palette.count) ? palette[id] : nil
@@ -313,7 +316,8 @@ final class BridgeClient {
             bg: obj["bg"] as? String ?? "#1E1E1E",
             fg: obj["fg"] as? String ?? "#FFFFFF",
             palette: palette,
-            lines: lines
+            lines: lines,
+            wraps: obj["wraps"] as? [Bool] ?? []
         )
     }
 

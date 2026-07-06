@@ -1416,13 +1416,17 @@ private struct CmuxTerminalView: View {
     }
 
     // NSAttributedString variant (for the selectable UITextView): same colors +
-    // links as attributedScreen, built as an NSAttributedString UIKit can select.
+    // links as attributedScreen. Long paths/URLs that soft-wrap across rows
+    // (styled.wraps) are re-joined for linkification, so tapping any visible
+    // fragment opens the FULL path — not the truncated per-row piece.
     private static func terminalNSAttributed(_ styled: CmuxStyledScreen) -> NSAttributedString {
-        let out = NSMutableAttributedString()
         let size: CGFloat = 12
         let defaultFg = UIColor(hexString: styled.fg) ?? .white
-        let lineCount = styled.lines.count
-        for (i, line) in styled.lines.enumerated() {
+
+        // 1) Per-line attributed strings (styles only; links applied per group).
+        var lineNS: [NSMutableAttributedString] = []
+        for line in styled.lines {
+            let ln = NSMutableAttributedString()
             for run in line {
                 let st = styled.style(run.styleId)
                 let font = UIFont.monospacedSystemFont(ofSize: size, weight: st?.bold == true ? .bold : .regular)
@@ -1438,45 +1442,74 @@ private struct CmuxTerminalView: View {
                 }
                 if st?.underline == true { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
                 if st?.strike == true { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
-                let piece = NSMutableAttributedString(string: run.text, attributes: attrs)
-                nsLinkify(piece, in: run.text)
-                out.append(piece)
+                ln.append(NSAttributedString(string: run.text, attributes: attrs))
             }
-            if i < lineCount - 1 { out.append(NSAttributedString(string: "\n")) }
+            lineNS.append(ln)
+        }
+
+        // 2) Group soft-wrapped rows and linkify each group's JOINED text.
+        var i = 0
+        while i < lineNS.count {
+            var end = i
+            while end < lineNS.count - 1, styled.wraps.indices.contains(end), styled.wraps[end] { end += 1 }
+            linkifyGroup(lineNS, from: i, to: end)
+            i = end + 1
+        }
+
+        // 3) Join with newlines.
+        let out = NSMutableAttributedString()
+        for (idx, ln) in lineNS.enumerated() {
+            out.append(ln)
+            if idx < lineNS.count - 1 { out.append(NSAttributedString(string: "\n")) }
         }
         return out
     }
 
-    // Set .link on URL/path substrings within one NS run (URLs win over paths).
-    private static func nsLinkify(_ piece: NSMutableAttributedString, in text: String) {
-        var urlRanges: [Range<String.Index>] = []
-        for match in text.matches(of: urlRegex) {
-            var s = String(text[match.range])
+    // Linkify across a wrap-group: regex runs on the concatenated text (so a path
+    // split over rows matches whole); the link URL carries the FULL match while
+    // the visual attributes land on each row's own sub-range.
+    private static func linkifyGroup(_ lines: [NSMutableAttributedString], from: Int, to: Int) {
+        let texts = (from...to).map { lines[$0].string }
+        let joined = texts.joined()
+        var offsets: [Int] = []
+        var acc = 0
+        for t in texts { offsets.append(acc); acc += (t as NSString).length }
+
+        func apply(_ range: NSRange, url: URL, color: UIColor) {
+            for (k, t) in texts.enumerated() {
+                let lineRange = NSRange(location: offsets[k], length: (t as NSString).length)
+                let inter = NSIntersectionRange(range, lineRange)
+                guard inter.length > 0 else { continue }
+                let local = NSRange(location: inter.location - offsets[k], length: inter.length)
+                guard local.location + local.length <= lines[from + k].length else { continue }
+                lines[from + k].addAttributes([.link: url,
+                                               .underlineStyle: NSUnderlineStyle.single.rawValue,
+                                               .foregroundColor: color], range: local)
+            }
+        }
+
+        var urlNSRanges: [NSRange] = []
+        for match in joined.matches(of: urlRegex) {
+            var s = String(joined[match.range])
             var trimmed = 0
             while let last = s.last, ".,;:!?)]}>\"'".contains(last) { s.removeLast(); trimmed += 1 }
             guard !s.isEmpty, let url = URL(string: s) else { continue }
-            let upper = text.index(match.range.upperBound, offsetBy: -trimmed)
-            let r = match.range.lowerBound..<upper
-            urlRanges.append(r)
-            nsApplyLink(piece, text: text, range: r, url: url, color: UIColor(red: 0.35, green: 0.66, blue: 1, alpha: 1))
+            let upper = joined.index(match.range.upperBound, offsetBy: -trimmed)
+            let ns = NSRange(match.range.lowerBound..<upper, in: joined)
+            guard ns.length > 0 else { continue }
+            urlNSRanges.append(ns)
+            apply(ns, url: url, color: UIColor(red: 0.35, green: 0.66, blue: 1, alpha: 1))
         }
-        for match in text.matches(of: pathRegex) {
-            if urlRanges.contains(where: { $0.overlaps(match.range) }) { continue }
-            let raw = String(text[match.range])
+        for match in joined.matches(of: pathRegex) {
+            let ns = NSRange(match.range, in: joined)
+            if urlNSRanges.contains(where: { NSIntersectionRange($0, ns).length > 0 }) { continue }
+            let raw = String(joined[match.range])
             var allowed = CharacterSet.urlQueryAllowed
             allowed.remove(charactersIn: "&=?+#")
             guard let enc = raw.addingPercentEncoding(withAllowedCharacters: allowed),
                   let url = URL(string: "cmuxfile://f?p=\(enc)") else { continue }
-            nsApplyLink(piece, text: text, range: match.range, url: url, color: UIColor(red: 0.93, green: 0.49, blue: 0.22, alpha: 1))
+            apply(ns, url: url, color: UIColor(red: 0.93, green: 0.49, blue: 0.22, alpha: 1))
         }
-    }
-
-    private static func nsApplyLink(_ piece: NSMutableAttributedString, text: String,
-                                    range: Range<String.Index>, url: URL, color: UIColor) {
-        let ns = NSRange(range, in: text)
-        guard ns.location != NSNotFound, ns.length > 0, ns.location + ns.length <= piece.length else { return }
-        piece.addAttributes([.link: url, .underlineStyle: NSUnderlineStyle.single.rawValue,
-                             .foregroundColor: color], range: ns)
     }
 
     // Quick special-key bar — interrupt a running agent (취소 = Ctrl-C), Esc, Tab,
