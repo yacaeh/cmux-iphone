@@ -801,7 +801,9 @@ private func isMarkdownName(_ name: String) -> Bool {
 
 /// Renders HTML in a WKWebView — either an inline string or a URL. URL mode
 /// streams the FULL file from the bridge (inline content is capped at 512KB by
-/// /cmux/file, which blanks out big HTML).
+/// /cmux/file, which blanks out big HTML). Shows a spinner while a (possibly
+/// multi-MB) page downloads and a visible error if the load fails — a silent
+/// black screen read as "broken".
 private struct WebPreview: UIViewRepresentable {
     enum Source: Equatable { case html(String), url(URL) }
     let source: Source
@@ -814,6 +816,30 @@ private struct WebPreview: UIViewRepresentable {
         wv.isOpaque = false
         wv.backgroundColor = .black
         wv.scrollView.backgroundColor = .black
+        wv.navigationDelegate = context.coordinator
+
+        let spinner = UIActivityIndicatorView(style: .large)
+        spinner.color = .white
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        spinner.hidesWhenStopped = true
+        wv.addSubview(spinner)
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = UIColor(white: 0.75, alpha: 1)
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        wv.addSubview(label)
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: wv.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: wv.centerYAnchor, constant: -20),
+            label.centerXAnchor.constraint(equalTo: wv.centerXAnchor),
+            label.topAnchor.constraint(equalTo: spinner.bottomAnchor, constant: 12),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: wv.leadingAnchor, constant: 24),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: wv.trailingAnchor, constant: -24),
+        ])
+        context.coordinator.spinner = spinner
+        context.coordinator.label = label
         return wv
     }
     func updateUIView(_ wv: WKWebView, context: Context) {
@@ -825,7 +851,31 @@ private struct WebPreview: UIViewRepresentable {
         }
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator { var last: Source? }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var last: Source?
+        weak var spinner: UIActivityIndicatorView?
+        weak var label: UILabel?
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            spinner?.startAnimating()
+            label?.text = "불러오는 중… (큰 파일은 시간이 걸립니다)"
+        }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            spinner?.stopAnimating()
+            label?.text = nil
+        }
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            fail(error)
+        }
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            fail(error)
+        }
+        private func fail(_ error: Error) {
+            spinner?.stopAnimating()
+            label?.text = "불러오지 못했습니다\n\(error.localizedDescription)"
+        }
+    }
 }
 
 /// Inline thumbnail for an image entry in a directory listing — fetches the image
@@ -1890,14 +1940,19 @@ private struct CmuxNodeScreen: View {
                 .background(Color.surfaceElevated)
             }
         } else {
-            ScrollView([.vertical, .horizontal]) {
-                Text(node.content.isEmpty ? "(빈 파일)" : node.content)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Color.textPrimary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: true, vertical: true)
-                    .padding(12)
-            }
+            // UITextView, not SwiftUI Text: a 512KB source string with fixedSize
+            // stalled layout indefinitely (black empty screen).
+            SelectableTerminalText(
+                attributed: NSAttributedString(
+                    string: node.content.isEmpty ? "(빈 파일)" : node.content,
+                    attributes: [
+                        .font: UIFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                        .foregroundColor: UIColor(hexString: "F4F3F1") ?? .white,
+                    ]),
+                background: UIColor(hexString: "0A0A0B") ?? .black,
+                onLink: { _ in }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .safeAreaInset(edge: .top, spacing: 0) {
                 HStack {
                     if node.truncated {
