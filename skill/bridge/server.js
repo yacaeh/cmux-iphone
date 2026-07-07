@@ -143,6 +143,10 @@ const sseClients = new Set();
 const pendingPermissions = new Map();
 /** @type {Map<string, Array>} */
 const pendingPermissionBodies = new Map();
+// (sessionId:toolName) pairs the user approved with "allow all" from the phone —
+// subsequent PermissionRequest hooks for the same pair auto-allow without
+// prompting. In-memory: resets on bridge restart (safe default).
+const autoAllowTools = new Set();
 /** Full permission-request payloads kept until resolved — re-sent to clients
  *  that (re)connect, so a backgrounded/reconnecting phone never misses one. */
 const pendingPermissionPayloads = new Map();
@@ -1259,6 +1263,14 @@ async function handleCommand(req, res) {
     if (decision) {
       if (allowAll && decision.behavior === "allow") {
         decision.updatedPermissions = pendingPermissionBodies.get(permissionId) || [];
+        // Also remember (session, tool) bridge-side: Claude Code doesn't always
+        // send permission_suggestions (MCP tools), and without them allow-all
+        // degrades to a one-shot allow — the phone gets re-prompted every call.
+        const stored = pendingPermissionPayloads.get(permissionId);
+        if (stored && stored.tool_name) {
+          autoAllowTools.add(`${stored.sessionId || ""}:${stored.tool_name}`);
+          log("info", `Auto-allow armed: ${stored.tool_name} (session ${stored.sessionId || "?"})`);
+        }
       }
       pendingPermissionBodies.delete(permissionId);
 
@@ -1580,6 +1592,19 @@ async function handleHookPermission(req, res) {
   req.socket.setTimeout(0);
 
   const sid = resolveHookSession(body);
+
+  // User already said "allow all" for this (session, tool) from the phone —
+  // answer immediately instead of re-prompting on every call.
+  if (body.tool_name && autoAllowTools.has(`${sid || ""}:${body.tool_name}`)) {
+    log("info", `Hook: PermissionRequest auto-allowed (${body.tool_name})${sid ? ` session=${sid}` : ""}`);
+    return jsonResponse(res, 200, {
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow" },
+      },
+    });
+  }
+
   const permissionId = crypto.randomUUID();
   log("info", `Hook: PermissionRequest received (id: ${permissionId})${sid ? ` session=${sid}` : ""}`, body.tool_name || "");
 

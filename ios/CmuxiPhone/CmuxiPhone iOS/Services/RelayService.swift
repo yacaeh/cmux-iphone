@@ -610,8 +610,11 @@ final class RelayService: ObservableObject {
                 ApprovalRequest.OptionItem(label: "No"),
             ]
         } else {
+            // MCP tools (mcp__*) land here — without an allow-all option every
+            // single call re-prompted the phone (browser agents fire dozens).
             options = [
                 ApprovalRequest.OptionItem(label: "Yes"),
+                ApprovalRequest.OptionItem(label: "Yes, allow all", description: "이 도구는 다시 묻지 않음"),
                 ApprovalRequest.OptionItem(label: "No"),
             ]
         }
