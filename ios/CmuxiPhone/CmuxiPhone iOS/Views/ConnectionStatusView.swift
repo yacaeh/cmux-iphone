@@ -1117,6 +1117,10 @@ private struct CmuxTerminalView: View {
     /// NSAttributedString variant for the selectable UITextView (native text
     /// selection + copy).
     @State private var renderedNS: NSAttributedString? = nil
+    /// Inline thumbnails for image paths visible on screen (path → downscaled
+    /// image). Populated lazily; screen re-renders as each arrives.
+    @State private var termThumbs: [String: UIImage] = [:]
+    @State private var termThumbFetching: Set<String> = []
     @State private var promptText: String = ""
     @State private var sending = false
     @State private var browseTarget: BrowseTarget? = nil
@@ -1212,11 +1216,42 @@ private struct CmuxTerminalView: View {
             styledScreen = s.styled
             if let st = s.styled, !st.lines.isEmpty {
                 rendered = Self.attributedScreen(st)
-                renderedNS = Self.terminalNSAttributed(st)
+                let (ns, imagePaths) = Self.terminalNSAttributed(st, thumbs: termThumbs)
+                renderedNS = ns
+                fetchTermThumbs(imagePaths)
             } else {
                 rendered = nil
                 renderedNS = nil
             }
+        }
+    }
+
+    // Fetch missing inline thumbnails for image paths on screen, then re-render.
+    private func fetchTermThumbs(_ paths: [String]) {
+        for p in Set(paths) where termThumbs[p] == nil && !termThumbFetching.contains(p) {
+            termThumbFetching.insert(p)
+            Task {
+                if case .ok(let node) = await relayService.cmuxFile(terminalId, path: p),
+                   node.kind == .image, let data = node.imageData, let full = UIImage(data: data) {
+                    // cheap cap so a long session can't hoard memory — drop the
+                    // cache and keep only the newly-fetched thumb
+                    if termThumbs.count > 40 { termThumbs.removeAll() }
+                    termThumbs[p] = Self.thumbnail(of: full, maxDim: 480)
+                    if let st = styledScreen {
+                        renderedNS = Self.terminalNSAttributed(st, thumbs: termThumbs).0
+                    }
+                }
+                termThumbFetching.remove(p)
+            }
+        }
+    }
+
+    private static func thumbnail(of image: UIImage, maxDim: CGFloat) -> UIImage {
+        let factor = min(1, maxDim / max(image.size.width, image.size.height, 1))
+        guard factor < 1 else { return image }
+        let target = CGSize(width: image.size.width * factor, height: image.size.height * factor)
+        return UIGraphicsImageRenderer(size: target).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: target))
         }
     }
 
@@ -1469,7 +1504,11 @@ private struct CmuxTerminalView: View {
     // links as attributedScreen. Long paths/URLs that soft-wrap across rows
     // (styled.wraps) are re-joined for linkification, so tapping any visible
     // fragment opens the FULL path — not the truncated per-row piece.
-    private static func terminalNSAttributed(_ styled: CmuxStyledScreen) -> NSAttributedString {
+    // Image paths found on screen get an INLINE thumbnail (from `thumbs`)
+    // appended under their line; the second return value lists every image path
+    // seen so the caller can fetch missing thumbnails.
+    private static func terminalNSAttributed(_ styled: CmuxStyledScreen,
+                                             thumbs: [String: UIImage] = [:]) -> (NSAttributedString, [String]) {
         let size: CGFloat = 12
         let defaultFg = UIColor(hexString: styled.fg) ?? .white
 
@@ -1498,27 +1537,54 @@ private struct CmuxTerminalView: View {
         }
 
         // 2) Group soft-wrapped rows and linkify each group's JOINED text.
+        //    Image paths are collected per group so their thumbnail can be
+        //    inserted right below the group's last line.
+        var imagePathsByLine: [Int: [String]] = [:]
+        var allImagePaths: [String] = []
         var i = 0
         while i < lineNS.count {
             var end = i
             while end < lineNS.count - 1, styled.wraps.indices.contains(end), styled.wraps[end] { end += 1 }
-            linkifyGroup(lineNS, from: i, to: end)
+            let found = linkifyGroup(lineNS, from: i, to: end)
+            if !found.isEmpty {
+                imagePathsByLine[end, default: []].append(contentsOf: found)
+                allImagePaths.append(contentsOf: found)
+            }
             i = end + 1
         }
 
-        // 3) Join with newlines.
+        // 3) Join with newlines, inserting inline thumbnails under their line.
         let out = NSMutableAttributedString()
         for (idx, ln) in lineNS.enumerated() {
             out.append(ln)
+            for p in imagePathsByLine[idx] ?? [] {
+                guard let img = thumbs[p] else { continue }
+                out.append(NSAttributedString(string: "\n"))
+                let att = NSTextAttachment()
+                att.image = img
+                let maxW: CGFloat = 230
+                let scale = min(1, maxW / max(img.size.width, 1))
+                att.bounds = CGRect(x: 0, y: 0, width: img.size.width * scale, height: img.size.height * scale)
+                let piece = NSMutableAttributedString(attachment: att)
+                var allowed = CharacterSet.urlQueryAllowed
+                allowed.remove(charactersIn: "&=?+#")
+                if let enc = p.addingPercentEncoding(withAllowedCharacters: allowed),
+                   let url = URL(string: "cmuxfile://f?p=\(enc)") {
+                    piece.addAttribute(.link, value: url, range: NSRange(location: 0, length: piece.length))
+                }
+                out.append(piece)
+            }
             if idx < lineNS.count - 1 { out.append(NSAttributedString(string: "\n")) }
         }
-        return out
+        return (out, allImagePaths)
     }
 
     // Linkify across a wrap-group: regex runs on the concatenated text (so a path
     // split over rows matches whole); the link URL carries the FULL match while
-    // the visual attributes land on each row's own sub-range.
-    private static func linkifyGroup(_ lines: [NSMutableAttributedString], from: Int, to: Int) {
+    // the visual attributes land on each row's own sub-range. Returns the image
+    // paths found (for inline thumbnails).
+    @discardableResult
+    private static func linkifyGroup(_ lines: [NSMutableAttributedString], from: Int, to: Int) -> [String] {
         let texts = (from...to).map { lines[$0].string }
         let joined = texts.joined()
         var offsets: [Int] = []
@@ -1550,6 +1616,7 @@ private struct CmuxTerminalView: View {
             urlNSRanges.append(ns)
             apply(ns, url: url, color: UIColor(red: 0.35, green: 0.66, blue: 1, alpha: 1))
         }
+        var imagePaths: [String] = []
         for match in joined.matches(of: pathRegex) {
             let ns = NSRange(match.range, in: joined)
             if urlNSRanges.contains(where: { NSIntersectionRange($0, ns).length > 0 }) { continue }
@@ -1559,7 +1626,9 @@ private struct CmuxTerminalView: View {
             guard let enc = raw.addingPercentEncoding(withAllowedCharacters: allowed),
                   let url = URL(string: "cmuxfile://f?p=\(enc)") else { continue }
             apply(ns, url: url, color: UIColor(red: 0.93, green: 0.49, blue: 0.22, alpha: 1))
+            if isImageName(raw) { imagePaths.append(raw) }
         }
+        return imagePaths
     }
 
     // Quick special-key bar — interrupt a running agent (취소 = Ctrl-C), Esc, Tab,
