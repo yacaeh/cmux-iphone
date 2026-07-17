@@ -1231,8 +1231,17 @@ private struct CmuxTerminalView: View {
         for p in Set(paths) where termThumbs[p] == nil && !termThumbFetching.contains(p) {
             termThumbFetching.insert(p)
             Task {
-                if case .ok(let node) = await relayService.cmuxFile(terminalId, path: p),
-                   node.kind == .image, let data = node.imageData, let full = UIImage(data: data) {
+                var full: UIImage? = nil
+                if case .ok(let node) = await relayService.cmuxFile(terminalId, path: p), node.kind == .image {
+                    if let data = node.imageData {
+                        full = UIImage(data: data)
+                    } else if let url = relayService.mediaURL(terminalId, path: node.path),
+                              let (data, _) = try? await URLSession.shared.data(from: url) {
+                        // >8MB images aren't inlined as base64 — stream instead.
+                        full = UIImage(data: data)
+                    }
+                }
+                if let full {
                     // cheap cap so a long session can't hoard memory — drop the
                     // cache and keep only the newly-fetched thumb
                     if termThumbs.count > 40 { termThumbs.removeAll() }
@@ -2045,12 +2054,15 @@ private struct CmuxNodeScreen: View {
     private func imageContent(_ node: CmuxNode) -> some View {
         if let data = node.imageData, let ui = UIImage(data: data) {
             ZoomableImage(image: ui)
+        } else if let url = relayService.mediaURL(terminalId, path: node.path) {
+            // Too large to inline as base64 — stream the full bytes instead.
+            StreamedZoomableImage(url: url)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "photo")
                     .font(.system(size: 34))
                     .foregroundStyle(Color.subtleText)
-                Text(node.truncated ? "이미지가 너무 큽니다 (8MB 초과)" : "이미지를 표시할 수 없습니다")
+                Text("이미지를 표시할 수 없습니다")
                     .font(.system(size: 14))
                     .foregroundStyle(Color.textPrimary)
                     .multilineTextAlignment(.center)
@@ -2342,6 +2354,45 @@ private struct VideoStreamView: View {
             player?.play()
         }
         .onDisappear { player?.pause() }
+    }
+}
+
+/// Streams a (large) image from the bridge, then shows it in the zoom viewer.
+private struct StreamedZoomableImage: View {
+    let url: URL
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                ZoomableImage(image: image)
+            } else if failed {
+                VStack(spacing: 12) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 34)).foregroundStyle(Color.subtleText)
+                    Text("이미지를 불러오지 못했습니다")
+                        .font(.system(size: 14)).foregroundStyle(Color.textPrimary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                VStack(spacing: 12) {
+                    ProgressView().tint(.white)
+                    Text("큰 이미지 불러오는 중…")
+                        .font(.system(size: 13)).foregroundStyle(Color.subtleText)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task {
+            guard image == nil else { return }
+            if let (data, _) = try? await URLSession.shared.data(from: url),
+               let ui = UIImage(data: data) {
+                image = ui
+            } else {
+                failed = true
+            }
+        }
     }
 }
 

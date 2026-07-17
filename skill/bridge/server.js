@@ -2034,6 +2034,52 @@ function cmuxPathDenied(p) {
   return false;
 }
 
+// Agents often print paths relative to their OUTPUT dir, not the cwd (e.g.
+// "feature-tour/5.png" living at <cwd>/apps/web/screenshots/feature-tour/5.png).
+// When cwd-relative resolution misses, BFS the tree under cwd for a directory
+// where the suffix exists. Bounded (depth + visit budget), skips heavy dirs.
+const CMUX_SEARCH_SKIP = new Set(["node_modules", ".git", "dist", "build", ".next", "target", "Pods", "DerivedData", ".venv", "venv"]);
+async function findBySuffix(baseDir, relPath, maxDepth = 6, budget = { n: 4000 }) {
+  const queue = [{ dir: baseDir, depth: 0 }];
+  while (queue.length) {
+    const { dir, depth } = queue.shift();
+    if (budget.n-- <= 0) return null;
+    const candidate = path.join(dir, relPath);
+    try { await fs.promises.access(candidate); return candidate; } catch {}
+    if (depth >= maxDepth) continue;
+    let entries;
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith(".") || CMUX_SEARCH_SKIP.has(e.name)) continue;
+      queue.push({ dir: path.join(dir, e.name), depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+// Shared path resolution for /cmux/file, /cmux/media, /cmux/mdview:
+// absolute paths honored; relative resolved against cwd with the suffix-search
+// fallback; realpath defeats symlinks; denylist checked on both forms.
+// Returns { rp } or { error, status }.
+async function resolveCmuxTarget(cwd, rel) {
+  const base = path.resolve(cwd);
+  let target, rp;
+  try {
+    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
+    rp = await fs.promises.realpath(target);
+  } catch {
+    if (!path.isAbsolute(rel)) {
+      const found = await findBySuffix(base, rel);
+      if (found) {
+        try { target = found; rp = await fs.promises.realpath(found); } catch {}
+      }
+    }
+    if (!rp) return { error: "not-found", status: 404 };
+  }
+  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) return { error: "denied", status: 403 };
+  return { rp };
+}
+
 async function handleCmuxFile(req, res) {
   if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -2045,20 +2091,9 @@ async function handleCmuxFile(req, res) {
   const cwd = await cmux.terminalCwd(id);
   if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
 
-  // Resolve relative paths against cwd; honor absolute paths. realpath defeats
-  // symlinks. The denylist is checked against both the resolved path and its
-  // realpath so neither a direct path nor a symlink can reach a secret.
-  let target, rp;
-  try {
-    const base = path.resolve(cwd);
-    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
-    rp = await fs.promises.realpath(target);
-  } catch {
-    return jsonResponse(res, 404, { error: "not-found" });
-  }
-  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) {
-    return jsonResponse(res, 403, { error: "denied" });
-  }
+  const resolved = await resolveCmuxTarget(cwd, rel);
+  if (resolved.error) return jsonResponse(res, resolved.status, { error: resolved.error });
+  const rp = resolved.rp;
 
   let st;
   try { st = await fs.promises.stat(rp); } catch { return jsonResponse(res, 404, { error: "not-found" }); }
@@ -2194,17 +2229,9 @@ async function handleCmuxMedia(req, res) {
   const cwd = await cmux.terminalCwd(id);
   if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
 
-  let target, rp;
-  try {
-    const base = path.resolve(cwd);
-    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
-    rp = await fs.promises.realpath(target);
-  } catch {
-    return jsonResponse(res, 404, { error: "not-found" });
-  }
-  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) {
-    return jsonResponse(res, 403, { error: "denied" });
-  }
+  const resolved = await resolveCmuxTarget(cwd, rel);
+  if (resolved.error) return jsonResponse(res, resolved.status, { error: resolved.error });
+  const rp = resolved.rp;
   let st;
   try { st = await fs.promises.stat(rp); } catch { return jsonResponse(res, 404, { error: "not-found" }); }
   if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
@@ -2283,17 +2310,9 @@ async function handleCmuxMdview(req, res) {
 
   const cwd = await cmux.terminalCwd(id);
   if (!cwd) return jsonResponse(res, 404, { error: "terminal-cwd-unavailable" });
-  let target, rp;
-  try {
-    const base = path.resolve(cwd);
-    target = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(base, rel);
-    rp = await fs.promises.realpath(target);
-  } catch {
-    return jsonResponse(res, 404, { error: "not-found" });
-  }
-  if (cmuxPathDenied(target) || cmuxPathDenied(rp)) {
-    return jsonResponse(res, 403, { error: "denied" });
-  }
+  const resolved = await resolveCmuxTarget(cwd, rel);
+  if (resolved.error) return jsonResponse(res, resolved.status, { error: resolved.error });
+  const rp = resolved.rp;
   let md;
   try {
     const st = await fs.promises.stat(rp);
