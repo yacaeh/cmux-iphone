@@ -360,7 +360,7 @@ export async function readTerminalText(id) {
 // colors (instead of one flat color) and keep CJK columns aligned. Returns
 // { cols, bg, fg, palette, lines } or null. `palette` maps style_id -> color/
 // attributes; `lines` is an array of rows, each a list of { t, s } runs.
-export async function readTerminalStyled(id) {
+export async function readTerminalStyled(id, maxLines = 400) {
   if (!CMUX_BIN || !id) return null;
   try {
     const r = await rpc("mobile.terminal.replay", { terminal_id: id });
@@ -393,7 +393,7 @@ export async function readTerminalStyled(id) {
         collapsed.push(ln);
       }
     }
-    const tail = collapsed.slice(-400);
+    const tail = collapsed.slice(-Math.max(1, maxLines));
     const def = styles[0] || {};
     const cols = rg.columns || 0;
     // wraps[i] = row i is completely full → its text visually continues on row
@@ -407,6 +407,18 @@ export async function readTerminalStyled(id) {
       lines: tail.map((p) => p.runs),
       wraps,
     };
+  } catch {
+    return null;
+  }
+}
+
+// Deep scrollback as plain text. mobile.terminal.replay caps scrollback at a
+// few hundred rows, but `read-screen --surface <id> --scrollback --lines N`
+// reaches thousands of lines back — used by the phone's history mode.
+export async function readDeepScrollback(id, lines = 3000) {
+  if (!CMUX_BIN || !id) return null;
+  try {
+    return await cmux(["read-screen", "--surface", id, "--scrollback", "--lines", String(lines)]);
   } catch {
     return null;
   }

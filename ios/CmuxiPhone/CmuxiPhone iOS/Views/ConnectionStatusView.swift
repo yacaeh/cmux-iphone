@@ -1121,6 +1121,11 @@ private struct CmuxTerminalView: View {
     /// image). Populated lazily; screen re-renders as each arrives.
     @State private var termThumbs: [String: UIImage] = [:]
     @State private var termThumbFetching: Set<String> = []
+    /// History mode: one-shot deep scrollback (3000 lines) with live polling
+    /// paused, so the user can scroll far back without the poll clobbering it.
+    @State private var historyMode = false
+    @State private var historyLoading = false
+    @State private var historyText: String? = nil
     @State private var promptText: String = ""
     @State private var sending = false
     @State private var browseTarget: BrowseTarget? = nil
@@ -1211,6 +1216,7 @@ private struct CmuxTerminalView: View {
     }
 
     private func refresh() async {
+        guard !historyMode else { return }  // paused while reading history
         if let s = await relayService.cmuxScreen(terminalId) {
             screen = s.text
             styledScreen = s.styled
@@ -1224,6 +1230,28 @@ private struct CmuxTerminalView: View {
                 renderedNS = nil
             }
         }
+    }
+
+    // Load a one-shot deep scrollback (read-screen reaches thousands of lines;
+    // the styled replay caps at a few hundred) and pause live polling.
+    private func enterHistory() {
+        historyMode = true
+        historyLoading = true
+        Task {
+            if let text = await relayService.cmuxHistory(terminalId, lines: 3000) {
+                historyText = text
+                let (ns, imagePaths) = Self.plainNSAttributed(text, thumbs: termThumbs)
+                renderedNS = ns
+                fetchTermThumbs(imagePaths)
+            }
+            historyLoading = false
+        }
+    }
+
+    private func exitHistory() {
+        historyMode = false
+        historyText = nil
+        Task { await refresh() }
     }
 
     // Fetch missing inline thumbnails for image paths on screen, then re-render.
@@ -1246,7 +1274,9 @@ private struct CmuxTerminalView: View {
                     // cache and keep only the newly-fetched thumb
                     if termThumbs.count > 40 { termThumbs.removeAll() }
                     termThumbs[p] = Self.thumbnail(of: full, maxDim: 480)
-                    if let st = styledScreen {
+                    if historyMode, let t = historyText {
+                        renderedNS = Self.plainNSAttributed(t, thumbs: termThumbs).0
+                    } else if let st = styledScreen {
                         renderedNS = Self.terminalNSAttributed(st, thumbs: termThumbs).0
                     }
                 }
@@ -1371,10 +1401,33 @@ private struct CmuxTerminalView: View {
                     .truncationMode(.middle)
                     .padding(.leading, 6)
                 Spacer(minLength: 0)
+                // History toggle: deep scrollback + paused polling ↔ live tail.
+                Button { historyMode ? exitHistory() : enterHistory() } label: {
+                    Image(systemName: historyMode ? "play.circle.fill" : "clock.arrow.circlepath")
+                        .font(.system(size: 15))
+                        .foregroundStyle(historyMode ? Color.statusGreen : Color.subtleText)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .background(Color.surfaceElevated)
+
+            if historyMode {
+                HStack(spacing: 6) {
+                    if historyLoading {
+                        ProgressView().controlSize(.mini).tint(Color.claudeAmber)
+                        Text("히스토리 불러오는 중…")
+                    } else {
+                        Image(systemName: "clock").font(.system(size: 10))
+                        Text("히스토리 모드 — 실시간 일시정지 (▶︎ 로 복귀)")
+                    }
+                    Spacer()
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(Color.claudeAmber)
+                .padding(.horizontal, 12).padding(.vertical, 4)
+                .background(Color.claudeAmber.opacity(0.10))
+            }
 
             Rectangle().fill(Color.hairline).frame(height: 1)
 
@@ -1383,6 +1436,7 @@ private struct CmuxTerminalView: View {
                 SelectableTerminalText(
                     attributed: renderedNS,
                     background: UIColor(hexString: styledScreen?.bg ?? "1E1E1E") ?? .black,
+                    autoScroll: !historyMode,
                     onLink: { handleTerminalURL($0) }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1562,7 +1616,34 @@ private struct CmuxTerminalView: View {
             i = end + 1
         }
 
-        // 3) Join with newlines, inserting inline thumbnails under their line.
+        return (joinWithThumbs(lineNS, imagePathsByLine: imagePathsByLine, thumbs: thumbs), allImagePaths)
+    }
+
+    // Plain-text render (history mode): mono + per-line linkification + inline
+    // thumbnails, without styled colors (deep scrollback is plain text only).
+    private static func plainNSAttributed(_ text: String,
+                                          thumbs: [String: UIImage] = [:]) -> (NSAttributedString, [String]) {
+        let font = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let fg = UIColor(hexString: "ECECEC") ?? .white
+        let lineNS: [NSMutableAttributedString] = text.components(separatedBy: "\n").map {
+            NSMutableAttributedString(string: $0, attributes: [.font: font, .foregroundColor: fg])
+        }
+        var imagePathsByLine: [Int: [String]] = [:]
+        var allImagePaths: [String] = []
+        for i in lineNS.indices {
+            let found = linkifyGroup(lineNS, from: i, to: i)
+            if !found.isEmpty {
+                imagePathsByLine[i] = found
+                allImagePaths.append(contentsOf: found)
+            }
+        }
+        return (joinWithThumbs(lineNS, imagePathsByLine: imagePathsByLine, thumbs: thumbs), allImagePaths)
+    }
+
+    // Join lines with newlines, inserting inline thumbnails under their line.
+    private static func joinWithThumbs(_ lineNS: [NSMutableAttributedString],
+                                       imagePathsByLine: [Int: [String]],
+                                       thumbs: [String: UIImage]) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for (idx, ln) in lineNS.enumerated() {
             out.append(ln)
@@ -1585,7 +1666,7 @@ private struct CmuxTerminalView: View {
             }
             if idx < lineNS.count - 1 { out.append(NSAttributedString(string: "\n")) }
         }
-        return (out, allImagePaths)
+        return out
     }
 
     // Linkify across a wrap-group: regex runs on the concatenated text (so a path
@@ -2126,6 +2207,7 @@ private extension UIColor {
 private struct SelectableTerminalText: UIViewRepresentable {
     let attributed: NSAttributedString
     let background: UIColor
+    var autoScroll: Bool = true
     let onLink: (URL) -> Void
 
     func makeUIView(context: Context) -> UITextView {
@@ -2149,12 +2231,16 @@ private struct SelectableTerminalText: UIViewRepresentable {
         // an in-progress selection. Auto-scroll to bottom on new output.
         if tv.attributedText?.string != attributed.string {
             let hadSelection = tv.selectedRange.length > 0
+            let offset = tv.contentOffset
             tv.attributedText = attributed
             tv.backgroundColor = background
-            if !hadSelection {
+            if !hadSelection && autoScroll {
                 DispatchQueue.main.async {
                     tv.scrollRangeToVisible(NSRange(location: max(0, attributed.length - 1), length: 0))
                 }
+            } else if !autoScroll {
+                // history mode: keep the reading position instead of jumping
+                DispatchQueue.main.async { tv.contentOffset = offset }
             }
         } else if tv.backgroundColor != background {
             tv.backgroundColor = background

@@ -1967,8 +1967,12 @@ async function handleCmuxScreen(req, res) {
   // for the approval echo-back verification to work; do not fold `styled` into it.
   const hash = text == null ? null : crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
   // styled: real per-run colors + CJK-aligned columns for the live terminal view.
-  // Optional/additive — older app builds just read `text`.
-  const styled = await cmux.readTerminalStyled(id);
+  // Optional/additive — older app builds just read `text`. ?lines= raises the
+  // scrollback depth (history mode); text/hash stay at the default depth so the
+  // approval-hash contract with cmux.screenHash is untouched.
+  const linesParam = parseInt(url.searchParams.get("lines"), 10);
+  const maxLines = Number.isInteger(linesParam) ? Math.min(Math.max(linesParam, 100), 5000) : 400;
+  const styled = await cmux.readTerminalStyled(id, maxLines);
   return jsonResponse(res, 200, { id, text: text || "", hash, styled });
 }
 
@@ -2344,6 +2348,22 @@ hr{border:none;border-top:1px solid #2a2a2c}
   return res.end(page);
 }
 
+// GET /cmux/history?id&lines — deep plain-text scrollback for the phone's
+// history mode (read-screen reaches thousands of lines; the styled replay
+// RPC caps scrollback at a few hundred rows).
+async function handleCmuxHistory(req, res) {
+  if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
+  const id = url.searchParams.get("id");
+  if (!id) return jsonResponse(res, 400, { error: "Missing id" });
+  const linesParam = parseInt(url.searchParams.get("lines"), 10);
+  const lines = Number.isInteger(linesParam) ? Math.min(Math.max(linesParam, 200), 10000) : 3000;
+  const text = await cmux.readDeepScrollback(id, lines);
+  if (text == null) return jsonResponse(res, 503, { error: "history-unavailable" });
+  return jsonResponse(res, 200, { id, text });
+}
+
 // GET /cmux/statuses — per-terminal run state for the dashboard. The cmux tree
 // only exposes is_ready (always true), so "running" is detected from the live
 // VISIBLE screen: vanilla Claude/Codex show "esc to interrupt" while generating;
@@ -2530,6 +2550,7 @@ const routes = {
   "GET /cmux/media": handleCmuxMedia,
   "HEAD /cmux/media": handleCmuxMedia,
   "GET /cmux/mdview": handleCmuxMdview,
+  "GET /cmux/history": handleCmuxHistory,
   "GET /cmux/statuses": handleCmuxStatuses,
   "POST /cmux/new-session": handleCmuxNewSession,
   "GET /proxy/open": handleProxyOpen,

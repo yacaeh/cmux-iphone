@@ -267,10 +267,13 @@ final class BridgeClient {
 
     /// Reads the plain-text screen of one cmux terminal, plus its hash (used to
     /// guard approval responses against the screen changing mid-flight).
-    func fetchCmuxScreen(terminalId: String) async throws -> CmuxScreen {
+    func fetchCmuxScreen(terminalId: String, lines: Int = 400) async throws -> CmuxScreen {
         guard let baseURL, let token else { throw BridgeError.networkError }
         var comps = URLComponents(url: baseURL.appendingPathComponent("cmux/screen"), resolvingAgainstBaseURL: false)
-        comps?.queryItems = [URLQueryItem(name: "id", value: terminalId)]
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: terminalId),
+            URLQueryItem(name: "lines", value: String(lines)),
+        ]
         guard let url = comps?.url else { throw BridgeError.networkError }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -365,6 +368,27 @@ final class BridgeClient {
             ))
         } catch {
             return .failed("불러오지 못했습니다")
+        }
+    }
+
+    /// Deep plain-text scrollback (history mode) — thousands of lines back.
+    func fetchCmuxHistory(terminalId: String, lines: Int = 3000) async -> String? {
+        guard let baseURL, let token else { return nil }
+        var comps = URLComponents(url: baseURL.appendingPathComponent("cmux/history"), resolvingAgainstBaseURL: false)
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: terminalId),
+            URLQueryItem(name: "lines", value: String(lines)),
+        ]
+        guard let url = comps?.url else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await performRequest(request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            return json?["text"] as? String
+        } catch {
+            return nil
         }
     }
 

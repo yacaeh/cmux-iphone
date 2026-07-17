@@ -269,8 +269,9 @@ final class RelayService: ObservableObject {
     }
 
     /// Read one cmux terminal's plain-text screen (with hash for safe responses).
-    func cmuxScreen(_ terminalId: String) async -> CmuxScreen? {
-        try? await bridgeClient.fetchCmuxScreen(terminalId: terminalId)
+    /// `lines` raises the styled scrollback depth (history mode).
+    func cmuxScreen(_ terminalId: String, lines: Int = 400) async -> CmuxScreen? {
+        try? await bridgeClient.fetchCmuxScreen(terminalId: terminalId, lines: lines)
     }
 
     /// Read a file or directory referenced in a terminal, scoped to its cwd.
@@ -300,6 +301,11 @@ final class RelayService: ObservableObject {
     /// Authenticated streaming URL for a video file in a terminal's cwd.
     func mediaURL(_ terminalId: String, path: String) -> URL? {
         bridgeClient.mediaURL(terminalId: terminalId, path: path)
+    }
+
+    /// Deep plain-text scrollback for history mode.
+    func cmuxHistory(_ terminalId: String, lines: Int = 3000) async -> String? {
+        await bridgeClient.fetchCmuxHistory(terminalId: terminalId, lines: lines)
     }
 
     /// URL rendering a markdown file as HTML (bridge-side, full content).
