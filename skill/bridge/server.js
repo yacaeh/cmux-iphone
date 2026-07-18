@@ -2357,8 +2357,11 @@ async function handleCmuxHistory(req, res) {
   if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
   const id = url.searchParams.get("id");
   if (!id) return jsonResponse(res, 400, { error: "Missing id" });
+  // read-screen returns at most what cmux's scrollback buffer holds, so a high
+  // cap just means "everything available" (measured: full 4.3k-line buffer in
+  // ~0.5s). 30k lines ≈ a few MB worst case — still one-shot on demand.
   const linesParam = parseInt(url.searchParams.get("lines"), 10);
-  const lines = Number.isInteger(linesParam) ? Math.min(Math.max(linesParam, 200), 10000) : 3000;
+  const lines = Number.isInteger(linesParam) ? Math.min(Math.max(linesParam, 200), 30000) : 3000;
   const text = await cmux.readDeepScrollback(id, lines);
   if (text == null) return jsonResponse(res, 503, { error: "history-unavailable" });
   return jsonResponse(res, 200, { id, text });

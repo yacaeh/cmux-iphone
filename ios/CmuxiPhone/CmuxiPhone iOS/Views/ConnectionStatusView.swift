@@ -1238,7 +1238,9 @@ private struct CmuxTerminalView: View {
         historyMode = true
         historyLoading = true
         Task {
-            if let text = await relayService.cmuxHistory(terminalId, lines: 3000) {
+            // 30000 = "everything cmux's scrollback buffer holds" (the CLI
+            // returns at most what's retained; measured full buffers in <1s).
+            if let text = await relayService.cmuxHistory(terminalId, lines: 30000) {
                 historyText = text
                 let (ns, imagePaths) = Self.plainNSAttributed(text, thumbs: termThumbs)
                 renderedNS = ns
@@ -1419,7 +1421,8 @@ private struct CmuxTerminalView: View {
                         Text("히스토리 불러오는 중…")
                     } else {
                         Image(systemName: "clock").font(.system(size: 10))
-                        Text("히스토리 모드 — 실시간 일시정지 (▶︎ 로 복귀)")
+                        let n = historyText.map { $0.components(separatedBy: "\n").count } ?? 0
+                        Text("히스토리 \(n)줄 (보관된 전체) — 실시간 일시정지 (▶︎ 로 복귀)")
                     }
                     Spacer()
                 }
