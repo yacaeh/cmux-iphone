@@ -2439,10 +2439,17 @@ private struct VideoStreamView: View {
         }
         .background(Color.black)
         .onAppear {
+            // Default audio session (.soloAmbient) is silenced by the ringer
+            // switch — set .playback so video audio behaves like a video app.
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try? AVAudioSession.sharedInstance().setActive(true)
             if player == nil { player = AVPlayer(url: url) }
             player?.play()
         }
-        .onDisappear { player?.pause() }
+        .onDisappear {
+            player?.pause()
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 }
 
