@@ -1245,6 +1245,8 @@ private struct CmuxTerminalView: View {
                 let (ns, imagePaths) = Self.plainNSAttributed(text, thumbs: termThumbs)
                 renderedNS = ns
                 fetchTermThumbs(imagePaths)
+            } else {
+                historyText = nil
             }
             historyLoading = false
         }
@@ -1275,7 +1277,8 @@ private struct CmuxTerminalView: View {
                     // cheap cap so a long session can't hoard memory — drop the
                     // cache and keep only the newly-fetched thumb
                     if termThumbs.count > 40 { termThumbs.removeAll() }
-                    termThumbs[p] = Self.thumbnail(of: full, maxDim: 480)
+                    // 1024px so full-width display stays sharp on 3x screens
+                    termThumbs[p] = Self.thumbnail(of: full, maxDim: 1024)
                     if historyMode, let t = historyText {
                         renderedNS = Self.plainNSAttributed(t, thumbs: termThumbs).0
                     } else if let st = styledScreen {
@@ -1419,10 +1422,12 @@ private struct CmuxTerminalView: View {
                     if historyLoading {
                         ProgressView().controlSize(.mini).tint(Color.claudeAmber)
                         Text("히스토리 불러오는 중…")
-                    } else {
+                    } else if let historyText {
                         Image(systemName: "clock").font(.system(size: 10))
-                        let n = historyText.map { $0.components(separatedBy: "\n").count } ?? 0
-                        Text("히스토리 \(n)줄 (보관된 전체) — 실시간 일시정지 (▶︎ 로 복귀)")
+                        Text("히스토리 \(historyText.components(separatedBy: "\n").count)줄 (보관된 전체) — 실시간 일시정지 (▶︎ 로 복귀)")
+                    } else {
+                        Image(systemName: "exclamationmark.triangle").font(.system(size: 10))
+                        Text("히스토리를 불러오지 못했습니다 — 다시 시도하려면 ▶︎ 후 🕐")
                     }
                     Spacer()
                 }
@@ -1655,7 +1660,9 @@ private struct CmuxTerminalView: View {
                 out.append(NSAttributedString(string: "\n"))
                 let att = NSTextAttachment()
                 att.image = img
-                let maxW: CGFloat = 230
+                // Fill the terminal's usable width (screen minus card + text
+                // insets), keeping aspect ratio; capped for iPad sanity.
+                let maxW: CGFloat = min(UIScreen.main.bounds.width - 50, 600)
                 let scale = min(1, maxW / max(img.size.width, 1))
                 att.bounds = CGRect(x: 0, y: 0, width: img.size.width * scale, height: img.size.height * scale)
                 let piece = NSMutableAttributedString(attachment: att)

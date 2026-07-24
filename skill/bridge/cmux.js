@@ -418,7 +418,14 @@ export async function readTerminalStyled(id, maxLines = 400) {
 export async function readDeepScrollback(id, lines = 3000) {
   if (!CMUX_BIN || !id) return null;
   try {
-    return await cmux(["read-screen", "--surface", id, "--scrollback", "--lines", String(lines)]);
+    // Big buffers exceed execFile's default 1MB maxBuffer (a busy session's
+    // scrollback can be several MB) — that made history silently 503. Raise it.
+    const { stdout } = await execFileP(
+      CMUX_BIN,
+      withAuth(["read-screen", "--surface", id, "--scrollback", "--lines", String(lines)]),
+      { encoding: "utf-8", timeout: 30000, maxBuffer: 64 * 1024 * 1024 }
+    );
+    return stdout;
   } catch {
     return null;
   }
