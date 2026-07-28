@@ -789,6 +789,11 @@ private func isVideoName(_ name: String) -> Bool {
     return ["mp4", "m4v", "mov", "webm", "m3u8"].contains(ext)
 }
 
+private func isAudioName(_ name: String) -> Bool {
+    let ext = (name as NSString).pathExtension.lowercased()
+    return ["mp3", "m4a", "aac", "wav", "aiff", "aif", "flac", "ogg", "caf"].contains(ext)
+}
+
 private func isHTMLName(_ name: String) -> Bool {
     let ext = (name as NSString).pathExtension.lowercased()
     return ext == "html" || ext == "htm"
@@ -2038,7 +2043,9 @@ private struct CmuxNodeScreen: View {
                 case .directory: directoryList(node)
                 case .file: fileContent(node)
                 case .image: imageContent(node)
-                case .video: videoContent(node)
+                // Audio streams through the same Range-backed media URL;
+                // AVPlayer plays it with the same transport controls.
+                case .video, .audio: videoContent(node)
                 }
             }
         }
@@ -2061,9 +2068,11 @@ private struct CmuxNodeScreen: View {
                             DirThumb(terminalId: terminalId, path: entry.path)
                         } else {
                             Image(systemName: entry.isDir ? "folder.fill"
-                                  : (isVideoName(entry.name) ? "film" : "doc.text"))
+                                  : (isVideoName(entry.name) ? "film"
+                                     : (isAudioName(entry.name) ? "music.note" : "doc.text")))
                                 .foregroundStyle(entry.isDir ? Color.claudeAmber
-                                                 : (isVideoName(entry.name) ? Color.claudeOrange : Color.subtleText))
+                                                 : (isVideoName(entry.name) || isAudioName(entry.name)
+                                                    ? Color.claudeOrange : Color.subtleText))
                                 .frame(width: 28)
                         }
                         Text(entry.name)

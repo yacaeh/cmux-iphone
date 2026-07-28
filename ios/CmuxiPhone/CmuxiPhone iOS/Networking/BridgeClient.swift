@@ -58,7 +58,7 @@ struct CmuxDirEntry: Identifiable {
 /// A filesystem node read from the Mac, scoped to the terminal's working
 /// directory — either a text file (with `content`) or a directory (`entries`).
 struct CmuxNode {
-    enum Kind { case file, directory, image, video }
+    enum Kind { case file, directory, image, video, audio }
     let kind: Kind
     let name: String
     let path: String
@@ -353,6 +353,7 @@ final class BridgeClient {
             case "dir": kind = .directory
             case "image": kind = .image
             case "video": kind = .video
+            case "audio": kind = .audio
             default: kind = .file
             }
             let imageData = (json?["data"] as? String).flatMap { Data(base64Encoded: $0) }

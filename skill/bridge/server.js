@@ -1994,6 +1994,12 @@ const CMUX_VIDEO_EXT = {
   ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
   ".webm": "video/webm", ".m3u8": "application/vnd.apple.mpegurl",
 };
+// Audio — streamed via /cmux/media like video; the phone plays with AVPlayer.
+const CMUX_AUDIO_EXT = {
+  ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+  ".wav": "audio/wav", ".aiff": "audio/aiff", ".aif": "audio/aiff",
+  ".flac": "audio/flac", ".ogg": "audio/ogg", ".caf": "audio/x-caf",
+};
 // /cmux/media also serves these so the phone can load FULL files (a WKWebView
 // can't render HTML truncated at the 512KB /cmux/file cap — it goes blank).
 const CMUX_MEDIA_MIME = {
@@ -2129,11 +2135,17 @@ async function handleCmuxFile(req, res) {
   }
   if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
 
-  // Videos → metadata only; the phone streams the bytes from /cmux/media.
+  // Videos/audio → metadata only; the phone streams the bytes from /cmux/media.
   const vidMime = CMUX_VIDEO_EXT[path.extname(rp).toLowerCase()];
   if (vidMime) {
     return jsonResponse(res, 200, {
       type: "video", name: path.basename(rp), path: rp, mime: vidMime, size: st.size,
+    });
+  }
+  const audMime = CMUX_AUDIO_EXT[path.extname(rp).toLowerCase()];
+  if (audMime) {
+    return jsonResponse(res, 200, {
+      type: "audio", name: path.basename(rp), path: rp, mime: audMime, size: st.size,
     });
   }
 
@@ -2241,8 +2253,8 @@ async function handleCmuxMedia(req, res) {
   if (!st.isFile()) return jsonResponse(res, 415, { error: "not-a-file" });
 
   const ext = path.extname(rp).toLowerCase();
-  const mime = CMUX_VIDEO_EXT[ext] || CMUX_MEDIA_MIME[ext] || CMUX_IMAGE_EXT[ext]
-    || "application/octet-stream";
+  const mime = CMUX_VIDEO_EXT[ext] || CMUX_AUDIO_EXT[ext] || CMUX_MEDIA_MIME[ext]
+    || CMUX_IMAGE_EXT[ext] || "application/octet-stream";
   const total = st.size;
   const range = req.headers.range;
   const baseHeaders = { "Content-Type": mime, "Accept-Ranges": "bytes" };
