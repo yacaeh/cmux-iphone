@@ -1932,53 +1932,128 @@ const normCodexCwd = (p) => String(p || "").replace(/^\/private(\/|$)/, "/").rep
 async function codexRolloutInfo(filePath, mtimeMs) {
   const hit = codexTitleCache.get(filePath);
   if (hit && hit.mtimeMs === mtimeMs) return hit;
-  const info = { mtimeMs, cwd: null, title: null };
+  const info = { mtimeMs, cwd: null, title: null, needles: [] };
+  const isInjected = (t) =>
+    t.startsWith("<") || t.startsWith("[") || t.startsWith("# AGENTS.md") || t.startsWith("You are `");
+  const userTextOf = (d) => {
+    const p = d.payload || {};
+    if (d.type === "event_msg" && p.type === "user_message") {
+      const msg = String(p.message || "").trim();
+      if (msg && !isInjected(msg)) return msg;
+    }
+    if (d.type === "response_item" && p.type === "message" && p.role === "user") {
+      for (const item of p.content || []) {
+        const t = String(item.text || "").trim();
+        if (t && !isInjected(t)) return t;
+      }
+    }
+    return null;
+  };
   try {
     // Interactive sessions emit event_msg/user_message; headless (codex exec /
     // teamclaude) don't — there the real prompt is an early response_item user
-    // message after system injections (AGENTS.md, <skills…>, [env], team
-    // preamble), which the prefix filter skips.
+    // message after system injections, which the prefix filter skips.
     const head = readFileSlice(filePath, 0, 2 * 1024 * 1024);
-    const isInjected = (t) =>
-      t.startsWith("<") || t.startsWith("[") || t.startsWith("# AGENTS.md") || t.startsWith("You are `");
-    let fallback = null;
+    let firstUser = null;
     for (const line of head.split("\n")) {
       if (!line.trim()) continue;
       let d;
       try { d = JSON.parse(line); } catch { continue; }
-      const p = d.payload || {};
-      if (d.type === "session_meta") { info.cwd = normCodexCwd(p.cwd); continue; }
-      if (d.type === "event_msg" && p.type === "user_message") {
-        const msg = String(p.message || "").trim();
-        if (msg) { info.title = msg.split("\n")[0].trim().slice(0, 60); break; }
-      }
-      if (!fallback && d.type === "response_item" && p.type === "message" && p.role === "user") {
-        for (const item of p.content || []) {
-          const t = String(item.text || "").trim();
-          if (t && !isInjected(t)) { fallback = t.split("\n")[0].trim().slice(0, 60); break; }
-        }
-      }
+      if (d.type === "session_meta") { info.cwd = normCodexCwd(d.payload?.cwd); continue; }
+      const t = userTextOf(d);
+      if (t) { firstUser = t; break; }
     }
-    if (!info.title) info.title = fallback;
+    if (firstUser) info.title = firstUser.split("\n")[0].trim().slice(0, 60);
+
+    // Disambiguation needles (whitespace-stripped so terminal line-wrapping
+    // can't break the match): the first AND last user messages of this rollout.
+    // Matched against the terminal's on-screen transcript to pin WHICH session
+    // runs in WHICH terminal when several share a cwd.
+    let lastUser = null;
+    try {
+      const st = fs.statSync(filePath);
+      const tail = readFileSlice(filePath, Math.max(0, st.size - 512 * 1024), 512 * 1024);
+      const lines = tail.split("\n");
+      for (let i = lines.length - 1; i > 0; i--) { // skip [0]: possibly partial
+        if (!lines[i].trim()) continue;
+        let d;
+        try { d = JSON.parse(lines[i]); } catch { continue; }
+        const t = userTextOf(d);
+        if (t) { lastUser = t; break; }
+      }
+    } catch {}
+    for (const raw of [firstUser, lastUser]) {
+      if (!raw) continue;
+      const flat = raw.replace(/\s+/g, "");
+      if (flat.length >= 12) info.needles.push(flat.slice(0, 32));
+    }
   } catch { /* unreadable rollout — leave nulls */ }
   codexTitleCache.set(filePath, info);
   return info;
 }
 
-// cwd -> freshest codex title, for rollouts touched in the last 3 days.
-async function codexTitlesByCwd() {
+// A rollout's cwd lives in its first line and never changes — cache by path.
+const codexCwdCache = new Map(); // filePath -> normalized cwd | null
+
+function codexRolloutCwd(filePath) {
+  if (codexCwdCache.has(filePath)) return codexCwdCache.get(filePath);
+  let cwd = null;
+  try {
+    // The session_meta line can be tens of KB (embedded instructions), so a
+    // full JSON.parse of a small slice fails — regex the cwd field instead.
+    const head = readFileSlice(filePath, 0, 128 * 1024);
+    const m = head.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (m) cwd = normCodexCwd(JSON.parse(`"${m[1]}"`)) || null;
+  } catch {}
+  codexCwdCache.set(filePath, cwd);
+  return cwd;
+}
+
+// cwd -> ALL recent rollouts (newest first) for the cwds we actually need.
+// Two-phase so the scan has NO recency cap (the shared 25-file limit made busy
+// teamclaude swarms push a terminal's own session out of the candidate set):
+// phase 1 reads only each rollout's first 4KB for its cwd; phase 2 fully parses
+// just the rollouts whose cwd matches a terminal on screen.
+async function codexRolloutsByCwd(wantedCwds) {
   const out = new Map();
-  const cutoff = Date.now() - 3 * 24 * 3600 * 1000;
-  let files = [];
-  try { files = listRecentCodexSessionFiles(CODEX_SESSION_ROOT); } catch {}
+  const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+  const files = [];
+  const stack = [CODEX_SESSION_ROOT];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) { stack.push(fullPath); continue; }
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const stat = safeStat(fullPath);
+      if (!stat || stat.mtimeMs < cutoff) continue;
+      files.push({ filePath: fullPath, mtimeMs: stat.mtimeMs });
+    }
+  }
   for (const f of files) {
-    if (f.mtimeMs < cutoff) continue;
+    const cwd = codexRolloutCwd(f.filePath);
+    if (!cwd || !wantedCwds.has(cwd)) continue;
     const info = await codexRolloutInfo(f.filePath, f.mtimeMs);
     if (!info.cwd || !info.title) continue;
-    const prev = out.get(info.cwd);
-    if (!prev || info.mtimeMs > prev.mtimeMs) out.set(info.cwd, info);
+    if (!out.has(info.cwd)) out.set(info.cwd, []);
+    out.get(info.cwd).push(info);
   }
+  for (const arr of out.values()) arr.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return out;
+}
+
+// Whitespace-stripped scrollback per terminal, briefly cached — used to find
+// which rollout's user messages actually appear on THIS terminal's screen.
+const termFlatCache = new Map(); // tid -> { at, flat }
+async function terminalFlatText(tid) {
+  const hit = termFlatCache.get(tid);
+  if (hit && Date.now() - hit.at < 8000) return hit.flat;
+  const txt = (await cmux.readDeepScrollback(tid, 1500)) || "";
+  const flat = txt.replace(/\s+/g, "");
+  termFlatCache.set(tid, { at: Date.now(), flat });
+  return flat;
 }
 
 // Titles cmux fell back to (no title set by the program): a path or a bare dir.
@@ -1987,6 +2062,12 @@ function titleLooksLikePath(title, cwd) {
   if (!t) return true;
   if (/^[~/…]/.test(t)) return true;
   return cwd ? t === path.basename(cwd) : false;
+}
+
+// Codex-wrapper command titles (gjc = codex wrapper in tmux, or bare codex):
+// the real session runs codex, but the title is just the launch command.
+function titleIsCodexCommand(title) {
+  return /^(gjc|codex)(\s|$)/.test(String(title || "").trim());
 }
 
 async function handleCmuxTree(req, res) {
@@ -2002,32 +2083,63 @@ async function handleCmuxTree(req, res) {
     return jsonResponse(res, 200, { available: false, workspaces: [] });
   }
   // Recover human titles for codex terminals (their TUI leaves the title as the
-  // cwd). Best-effort — an empty map just keeps the original titles.
-  let codexTitles = new Map();
-  try { codexTitles = await codexTitlesByCwd(); } catch {}
-  const titleFor = (t) => {
-    if (!titleLooksLikePath(t.title, t.current_directory)) return t.title;
-    const ct = codexTitles.get(normCodexCwd(t.current_directory));
-    return ct ? `◆ ${ct.title}` : t.title;
+  // cwd). When several rollouts share a cwd, pin each terminal to ITS session by
+  // checking which rollout's user messages appear in that terminal's scrollback.
+  const wantedCwds = new Set();
+  for (const w of data.workspaces || []) {
+    for (const t of w.terminals || []) {
+      if (titleLooksLikePath(t.title, t.current_directory) || titleIsCodexCommand(t.title)) {
+        const c = normCodexCwd(t.current_directory);
+        if (c) wantedCwds.add(c);
+      }
+    }
+  }
+  let codexRollouts = new Map();
+  try { codexRollouts = await codexRolloutsByCwd(wantedCwds); } catch {}
+  const titleFor = async (t) => {
+    const pathy = titleLooksLikePath(t.title, t.current_directory);
+    const cmd = titleIsCodexCommand(t.title);
+    if (!pathy && !cmd) return t.title;
+    const entries = codexRollouts.get(normCodexCwd(t.current_directory));
+    if (!entries || entries.length === 0) return t.title;
+    // Pin by screen content whenever ambiguous (several rollouts share the cwd)
+    // or the title is just the launch command (gjc/codex wrappers).
+    if (entries.length > 1 || cmd) {
+      try {
+        const flat = await terminalFlatText(t.id);
+        if (flat) {
+          const matched = entries.find((e) => e.needles.some((n) => flat.includes(n)));
+          if (matched) return `◆ ${matched.title}`;
+        }
+      } catch {}
+      return t.title; // no on-screen evidence — don't guess
+    }
+    return `◆ ${entries[0].title}`; // path title + exactly one candidate
   };
 
-  const workspaces = (data.workspaces || [])
-    .filter((w) => w.title !== "Agent Bridge") // hide the bridge's own workspace
-    .map((w) => ({
-    id: w.id,
-    title: w.title,
-    cwd: w.current_directory,
-    selected: !!w.is_selected,
-    hasUnread: !!w.has_unread,
-    preview: w.preview || null,
-    terminals: (w.terminals || []).map((t) => ({
-      id: t.id,
-      title: titleFor(t),
-      cwd: t.current_directory,
-      focused: !!t.is_focused,
-      ready: !!t.is_ready,
-    })),
-  }));
+  const wsSrc = (data.workspaces || []).filter((w) => w.title !== "Agent Bridge");
+  const workspaces = [];
+  for (const w of wsSrc) {
+    const terminals = [];
+    for (const t of w.terminals || []) {
+      terminals.push({
+        id: t.id,
+        title: await titleFor(t),
+        cwd: t.current_directory,
+        focused: !!t.is_focused,
+        ready: !!t.is_ready,
+      });
+    }
+    workspaces.push({
+      id: w.id,
+      title: w.title,
+      cwd: w.current_directory,
+      selected: !!w.is_selected,
+      hasUnread: !!w.has_unread,
+      preview: w.preview || null,
+      terminals,
+    });
+  }
   return jsonResponse(res, 200, { available: true, workspaces });
 }
 
