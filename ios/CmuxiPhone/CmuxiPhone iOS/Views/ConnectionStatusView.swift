@@ -636,6 +636,7 @@ private struct NewSessionView: View {
                     Picker("에이전트", selection: $agent) {
                         Text("Claude").tag("claude")
                         Text("Codex").tag("codex")
+                        Text("터미널").tag("shell")
                     }
                     .pickerStyle(.segmented)
                 }
@@ -2302,6 +2303,11 @@ final class SnippetStore: ObservableObject {
             snippets = Self.defaults
             save()
         }
+        // Migration: seed newly-added defaults into existing installs (defaults
+        // are only written on first launch, so later additions need this).
+        for seed in Self.defaults where !snippets.contains(where: { $0.text == seed.text }) {
+            if seed.text == "teamclaude run" { snippets.append(seed); save() }
+        }
     }
 
     func save() {
@@ -2316,6 +2322,7 @@ final class SnippetStore: ObservableObject {
     func delete(at offsets: IndexSet) { snippets.remove(atOffsets: offsets); save() }
 
     static let defaults: [PromptSnippet] = [
+        .init(label: "teamclaude", text: "teamclaude run"),
         .init(label: "가재코드", text: "gjc --tmux"),
         .init(label: "omo (madmax)", text: "omx --madmax --high"),
         .init(label: "/clear", text: "/clear"),

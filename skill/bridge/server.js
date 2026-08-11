@@ -2292,7 +2292,7 @@ async function handleCmuxNewSession(req, res) {
   if (!authOk(req, url)) return jsonResponse(res, 401, { error: "Unauthorized" });
   let body;
   try { body = await readBody(req); } catch { return jsonResponse(res, 400, { error: "bad-body" }); }
-  const agent = body.agent === "codex" ? "codex" : "claude";
+  const agent = ["codex", "shell"].includes(body.agent) ? body.agent : "claude";
   const cwd = typeof body.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : null;
   const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : null;
   if (cwd) {

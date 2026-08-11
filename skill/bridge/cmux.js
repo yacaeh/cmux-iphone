@@ -236,8 +236,10 @@ export async function terminalCwd(id) {
 // descendant), so the new workspace lands in cmux and shows up in the mirror.
 export async function newSession({ cwd, agent, name } = {}) {
   if (!CMUX_BIN) throw new Error("cmux binary not found");
-  const command = agent === "codex" ? "codex" : "claude";
-  const args = ["new-workspace", "--command", command, "--focus", "false"];
+  // "shell" opens a plain terminal (no agent command).
+  const command = agent === "codex" ? "codex" : agent === "shell" ? null : "claude";
+  const args = ["new-workspace", "--focus", "false"];
+  if (command) args.push("--command", command);
   if (cwd) args.push("--cwd", cwd);
   if (name) args.push("--name", name);
   await cmux(args);
