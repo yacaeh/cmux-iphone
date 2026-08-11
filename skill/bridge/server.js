@@ -1959,6 +1959,7 @@ async function codexRolloutInfo(filePath, mtimeMs) {
       const t = line.trim();
       if (!t || /^[<\[#`>-]/.test(t)) continue;
       if (/^you are\b/i.test(t)) continue; // agent-role preambles, not the task
+      if (/agents\.md|operating contract|multi.?agent/i.test(t)) continue; // more preamble shapes
       // SHOUTING preamble rules ("DO NOT STOP TO ASK …") — not the task either
       const letters = t.replace(/[^A-Za-z]/g, "");
       if (letters.length >= 6 && letters.replace(/[^A-Z]/g, "").length / letters.length > 0.6) continue;
