@@ -1935,17 +1935,31 @@ async function codexRolloutInfo(filePath, mtimeMs) {
   const info = { mtimeMs, cwd: null, title: null, needles: [] };
   const isInjected = (t) =>
     t.startsWith("<") || t.startsWith("[") || t.startsWith("# AGENTS.md") || t.startsWith("You are `");
-  const userTextOf = (d) => {
+  // includeInjected: automation-driven sessions (teamclaude workers) receive
+  // ONLY injected payloads as user messages — those still appear on the TUI
+  // screen, so they're valid MATCHING evidence even when unfit as a title.
+  const userTextOf = (d, includeInjected = false) => {
     const p = d.payload || {};
     if (d.type === "event_msg" && p.type === "user_message") {
       const msg = String(p.message || "").trim();
-      if (msg && !isInjected(msg)) return msg;
+      if (msg && (includeInjected || !isInjected(msg))) return msg;
     }
     if (d.type === "response_item" && p.type === "message" && p.role === "user") {
       for (const item of p.content || []) {
         const t = String(item.text || "").trim();
-        if (t && !isInjected(t)) return t;
+        if (t && (includeInjected || !isInjected(t))) return t;
       }
+    }
+    return null;
+  };
+  // Title fallback for injected-only sessions: first contentful line that isn't
+  // a tag/bracket/heading wrapper.
+  const titleFromInjected = (raw) => {
+    for (const line of String(raw || "").split("\n")) {
+      const t = line.trim();
+      if (!t || /^[<\[#`>-]/.test(t)) continue;
+      if (/^you are\b/i.test(t)) continue; // agent-role preambles, not the task
+      return t.slice(0, 60);
     }
     return null;
   };
@@ -1955,6 +1969,7 @@ async function codexRolloutInfo(filePath, mtimeMs) {
     // message after system injections, which the prefix filter skips.
     const head = readFileSlice(filePath, 0, 2 * 1024 * 1024);
     let firstUser = null;
+    let firstInjected = null;
     for (const line of head.split("\n")) {
       if (!line.trim()) continue;
       let d;
@@ -1962,8 +1977,10 @@ async function codexRolloutInfo(filePath, mtimeMs) {
       if (d.type === "session_meta") { info.cwd = normCodexCwd(d.payload?.cwd); continue; }
       const t = userTextOf(d);
       if (t) { firstUser = t; break; }
+      if (!firstInjected) firstInjected = userTextOf(d, true);
     }
     if (firstUser) info.title = firstUser.split("\n")[0].trim().slice(0, 60);
+    else if (firstInjected) info.title = titleFromInjected(firstInjected);
 
     // Disambiguation needles (whitespace-stripped so terminal line-wrapping
     // can't break the match), matched against the terminal's on-screen
@@ -1980,7 +1997,7 @@ async function codexRolloutInfo(filePath, mtimeMs) {
         if (!lines[i].trim()) continue;
         let d;
         try { d = JSON.parse(lines[i]); } catch { continue; }
-        const t = userTextOf(d);
+        const t = userTextOf(d, true); // injected payloads are on-screen too
         if (t) recentUsers.push(t);
       }
     } catch {}
@@ -2039,9 +2056,14 @@ async function codexRolloutsByCwd(wantedCwds) {
       files.push({ filePath: fullPath, mtimeMs: stat.mtimeMs });
     }
   }
+  // Sessions may have been launched from a parent/child dir of the terminal's
+  // cwd — accept ancestor/descendant rollouts too (keyed by the rollout's own
+  // cwd; the caller screen-matches fuzzy candidates, never blind-assigns them).
+  const related = (a, b) => a === b || a.startsWith(b + "/") || b.startsWith(a + "/");
+  const wanted = [...wantedCwds];
   for (const f of files) {
     const cwd = codexRolloutCwd(f.filePath);
-    if (!cwd || !wantedCwds.has(cwd)) continue;
+    if (!cwd || !wanted.some((w) => related(cwd, w))) continue;
     const info = await codexRolloutInfo(f.filePath, f.mtimeMs);
     if (!info.cwd || !info.title) continue;
     if (!out.has(info.cwd)) out.set(info.cwd, []);
@@ -2107,11 +2129,21 @@ async function handleCmuxTree(req, res) {
     const pathy = titleLooksLikePath(t.title, t.current_directory);
     const cmd = titleIsCodexCommand(t.title);
     if (!pathy && !cmd) return t.title;
-    const entries = codexRollouts.get(normCodexCwd(t.current_directory));
-    if (!entries || entries.length === 0) return t.title;
+    const cwd = normCodexCwd(t.current_directory);
+    let entries = codexRollouts.get(cwd) || [];
+    let fuzzy = false;
+    if (entries.length === 0 && cwd) {
+      // ancestor/descendant cwd fallback — screen-match only, never blind
+      for (const [c, arr] of codexRollouts) {
+        if (c !== cwd && (c.startsWith(cwd + "/") || cwd.startsWith(c + "/"))) entries = entries.concat(arr);
+      }
+      entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      fuzzy = true;
+    }
+    if (entries.length === 0) return t.title;
     // Pin by screen content whenever ambiguous (several rollouts share the cwd)
     // or the title is just the launch command (gjc/codex wrappers).
-    if (entries.length > 1 || cmd) {
+    if (entries.length > 1 || cmd || fuzzy) {
       try {
         const flat = await terminalFlatText(t.id);
         if (flat) {
