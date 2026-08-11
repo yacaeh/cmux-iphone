@@ -1921,6 +1921,74 @@ function authOk(req, url) {
 }
 
 // GET /cmux/tree — live cmux workspaces -> terminals for the mobile mirror.
+// --- codex session titles ---------------------------------------------------
+// Codex's TUI doesn't set the terminal title (Claude does — the "✳ …" ones), so
+// cmux falls back to the cwd/dir name. Recover a human title from the codex
+// rollout (~/.codex/sessions/**.jsonl): the FIRST user_message of the most
+// recent rollout whose meta.cwd matches the terminal's cwd. Cached by mtime.
+const codexTitleCache = new Map(); // filePath -> { mtimeMs, cwd, title }
+const normCodexCwd = (p) => String(p || "").replace(/^\/private(\/|$)/, "/").replace(/\/+$/, "");
+
+async function codexRolloutInfo(filePath, mtimeMs) {
+  const hit = codexTitleCache.get(filePath);
+  if (hit && hit.mtimeMs === mtimeMs) return hit;
+  const info = { mtimeMs, cwd: null, title: null };
+  try {
+    // Interactive sessions emit event_msg/user_message; headless (codex exec /
+    // teamclaude) don't — there the real prompt is an early response_item user
+    // message after system injections (AGENTS.md, <skills…>, [env], team
+    // preamble), which the prefix filter skips.
+    const head = readFileSlice(filePath, 0, 2 * 1024 * 1024);
+    const isInjected = (t) =>
+      t.startsWith("<") || t.startsWith("[") || t.startsWith("# AGENTS.md") || t.startsWith("You are `");
+    let fallback = null;
+    for (const line of head.split("\n")) {
+      if (!line.trim()) continue;
+      let d;
+      try { d = JSON.parse(line); } catch { continue; }
+      const p = d.payload || {};
+      if (d.type === "session_meta") { info.cwd = normCodexCwd(p.cwd); continue; }
+      if (d.type === "event_msg" && p.type === "user_message") {
+        const msg = String(p.message || "").trim();
+        if (msg) { info.title = msg.split("\n")[0].trim().slice(0, 60); break; }
+      }
+      if (!fallback && d.type === "response_item" && p.type === "message" && p.role === "user") {
+        for (const item of p.content || []) {
+          const t = String(item.text || "").trim();
+          if (t && !isInjected(t)) { fallback = t.split("\n")[0].trim().slice(0, 60); break; }
+        }
+      }
+    }
+    if (!info.title) info.title = fallback;
+  } catch { /* unreadable rollout — leave nulls */ }
+  codexTitleCache.set(filePath, info);
+  return info;
+}
+
+// cwd -> freshest codex title, for rollouts touched in the last 3 days.
+async function codexTitlesByCwd() {
+  const out = new Map();
+  const cutoff = Date.now() - 3 * 24 * 3600 * 1000;
+  let files = [];
+  try { files = listRecentCodexSessionFiles(CODEX_SESSION_ROOT); } catch {}
+  for (const f of files) {
+    if (f.mtimeMs < cutoff) continue;
+    const info = await codexRolloutInfo(f.filePath, f.mtimeMs);
+    if (!info.cwd || !info.title) continue;
+    const prev = out.get(info.cwd);
+    if (!prev || info.mtimeMs > prev.mtimeMs) out.set(info.cwd, info);
+  }
+  return out;
+}
+
+// Titles cmux fell back to (no title set by the program): a path or a bare dir.
+function titleLooksLikePath(title, cwd) {
+  const t = String(title || "").trim();
+  if (!t) return true;
+  if (/^[~/…]/.test(t)) return true;
+  return cwd ? t === path.basename(cwd) : false;
+}
+
 async function handleCmuxTree(req, res) {
   if (req.method !== "GET") return jsonResponse(res, 405, { error: "Method not allowed" });
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -1933,6 +2001,16 @@ async function handleCmuxTree(req, res) {
   if (!data || !Array.isArray(data.workspaces)) {
     return jsonResponse(res, 200, { available: false, workspaces: [] });
   }
+  // Recover human titles for codex terminals (their TUI leaves the title as the
+  // cwd). Best-effort — an empty map just keeps the original titles.
+  let codexTitles = new Map();
+  try { codexTitles = await codexTitlesByCwd(); } catch {}
+  const titleFor = (t) => {
+    if (!titleLooksLikePath(t.title, t.current_directory)) return t.title;
+    const ct = codexTitles.get(normCodexCwd(t.current_directory));
+    return ct ? `◆ ${ct.title}` : t.title;
+  };
+
   const workspaces = (data.workspaces || [])
     .filter((w) => w.title !== "Agent Bridge") // hide the bridge's own workspace
     .map((w) => ({
@@ -1944,7 +2022,7 @@ async function handleCmuxTree(req, res) {
     preview: w.preview || null,
     terminals: (w.terminals || []).map((t) => ({
       id: t.id,
-      title: t.title,
+      title: titleFor(t),
       cwd: t.current_directory,
       focused: !!t.is_focused,
       ready: !!t.is_ready,
