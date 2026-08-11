@@ -1966,26 +1966,33 @@ async function codexRolloutInfo(filePath, mtimeMs) {
     if (firstUser) info.title = firstUser.split("\n")[0].trim().slice(0, 60);
 
     // Disambiguation needles (whitespace-stripped so terminal line-wrapping
-    // can't break the match): the first AND last user messages of this rollout.
-    // Matched against the terminal's on-screen transcript to pin WHICH session
-    // runs in WHICH terminal when several share a cwd.
-    let lastUser = null;
+    // can't break the match), matched against the terminal's on-screen
+    // transcript to pin WHICH session runs in WHICH terminal. Korean prompts
+    // are often very short ("증거보여줘"), so instead of just first+last we
+    // collect several recent user messages and prefer the LONGEST (most
+    // distinctive) ones.
+    const recentUsers = [];
     try {
       const st = fs.statSync(filePath);
       const tail = readFileSlice(filePath, Math.max(0, st.size - 512 * 1024), 512 * 1024);
       const lines = tail.split("\n");
-      for (let i = lines.length - 1; i > 0; i--) { // skip [0]: possibly partial
+      for (let i = lines.length - 1; i > 0 && recentUsers.length < 8; i--) { // [0] may be partial
         if (!lines[i].trim()) continue;
         let d;
         try { d = JSON.parse(lines[i]); } catch { continue; }
         const t = userTextOf(d);
-        if (t) { lastUser = t; break; }
+        if (t) recentUsers.push(t);
       }
     } catch {}
-    for (const raw of [firstUser, lastUser]) {
-      if (!raw) continue;
+    const candidates = [];
+    if (recentUsers[0]) candidates.push(recentUsers[0]); // newest — most likely on screen
+    candidates.push(...[...recentUsers.slice(1)].sort((a, b) => b.length - a.length).slice(0, 2));
+    if (firstUser) candidates.push(firstUser);
+    for (const raw of candidates) {
       const flat = raw.replace(/\s+/g, "");
-      if (flat.length >= 12) info.needles.push(flat.slice(0, 32));
+      if (flat.length >= 5 && !info.needles.includes(flat.slice(0, 40))) {
+        info.needles.push(flat.slice(0, 40));
+      }
     }
   } catch { /* unreadable rollout — leave nulls */ }
   codexTitleCache.set(filePath, info);
@@ -2108,8 +2115,17 @@ async function handleCmuxTree(req, res) {
       try {
         const flat = await terminalFlatText(t.id);
         if (flat) {
-          const matched = entries.find((e) => e.needles.some((n) => flat.includes(n)));
-          if (matched) return `◆ ${matched.title}`;
+          // A terminal's scrollback can hold SEVERAL sessions run back-to-back
+          // — the CURRENT one is whichever conversation appears LOWEST on
+          // screen, so score by the deepest on-screen position of any needle.
+          let best = null, bestPos = -1;
+          for (const e of entries) {
+            for (const n of e.needles) {
+              const pos = flat.lastIndexOf(n);
+              if (pos > bestPos) { bestPos = pos; best = e; }
+            }
+          }
+          if (best) return `◆ ${best.title}`;
         }
       } catch {}
       return t.title; // no on-screen evidence — don't guess
