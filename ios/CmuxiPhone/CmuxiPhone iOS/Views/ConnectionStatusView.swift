@@ -2018,17 +2018,33 @@ private enum MediaSaver {
         } catch { return .failed(error.localizedDescription) }
     }
 
+    /// Long-timeout session: the default 60s request timeout aborted large
+    /// video downloads over LTE. timeoutIntervalForRequest is per-STALL (data
+    /// silence), resource is the whole-transfer budget.
+    static let dlSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 120
+        c.timeoutIntervalForResource = 1800
+        return URLSession(configuration: c)
+    }()
+
     /// Stream a media URL to a temp file (named so share sheets/Photos keep the
-    /// right type). Returns nil on failure.
-    static func downloadToTemp(_ url: URL, filename: String) async -> URL? {
-        guard let (tmp, resp) = try? await URLSession.shared.download(from: url),
-              (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else { return nil }
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try? FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
-        let out = dst.appendingPathComponent(filename)
-        do { try FileManager.default.moveItem(at: tmp, to: out); return out }
-        catch { return nil }
+    /// right type). Returns (file, errorMessage) — exactly one is non-nil.
+    static func downloadToTemp(_ url: URL, filename: String) async -> (URL?, String?) {
+        do {
+            let (tmp, resp) = try await dlSession.download(from: url)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                return (nil, "서버 응답 오류 (\((resp as? HTTPURLResponse)?.statusCode ?? -1))")
+            }
+            let dst = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+            let out = dst.appendingPathComponent(filename)
+            try FileManager.default.moveItem(at: tmp, to: out)
+            return (out, nil)
+        } catch {
+            return (nil, error.localizedDescription)
+        }
     }
 }
 
@@ -2301,18 +2317,24 @@ private struct CmuxNodeScreen: View {
     }
 
     private func saveToPhotos(_ node: CmuxNode) {
+        // Photos can't ingest webm — route those through 공유 instead.
+        if (node.name as NSString).pathExtension.lowercased() == "webm" {
+            mediaMsg = "webm은 사진 앱이 지원하지 않습니다 — '공유'로 파일 앱에 저장하세요"
+            return
+        }
         mediaBusy = true
-        Task {
+        Task { @MainActor in
             defer { mediaBusy = false }
             let result: MediaSaveResult
             if node.kind == .image {
-                guard let d = await mediaData(node) else { mediaMsg = "다운로드 실패"; return }
+                guard let d = await mediaData(node) else { mediaMsg = "이미지 다운로드 실패"; return }
                 result = await MediaSaver.saveImageData(d)
             } else {
-                guard let url = relayService.mediaURL(terminalId, path: node.path),
-                      let tmp = await MediaSaver.downloadToTemp(url, filename: node.name) else {
-                    mediaMsg = "다운로드 실패"; return
+                guard let url = relayService.mediaURL(terminalId, path: node.path) else {
+                    mediaMsg = "브리지 연결 없음"; return
                 }
+                let (tmp, err) = await MediaSaver.downloadToTemp(url, filename: node.name)
+                guard let tmp else { mediaMsg = "다운로드 실패: \(err ?? "?")"; return }
                 result = await MediaSaver.saveVideoFile(tmp)
             }
             switch result {
@@ -2325,7 +2347,7 @@ private struct CmuxNodeScreen: View {
 
     private func shareMedia(_ node: CmuxNode) {
         mediaBusy = true
-        Task {
+        Task { @MainActor in
             defer { mediaBusy = false }
             if let d = node.imageData {
                 // write inline image data to a named temp file for the share sheet
@@ -2334,11 +2356,12 @@ private struct CmuxNodeScreen: View {
                 let out = dir.appendingPathComponent(node.name)
                 guard (try? d.write(to: out)) != nil else { mediaMsg = "파일 준비 실패"; return }
                 shareItem = ShareItem(url: out)
-            } else if let url = relayService.mediaURL(terminalId, path: node.path),
-                      let tmp = await MediaSaver.downloadToTemp(url, filename: node.name) {
-                shareItem = ShareItem(url: tmp)
+            } else if let url = relayService.mediaURL(terminalId, path: node.path) {
+                let (tmp, err) = await MediaSaver.downloadToTemp(url, filename: node.name)
+                if let tmp { shareItem = ShareItem(url: tmp) }
+                else { mediaMsg = "다운로드 실패: \(err ?? "?")" }
             } else {
-                mediaMsg = "다운로드 실패"
+                mediaMsg = "브리지 연결 없음"
             }
         }
     }
