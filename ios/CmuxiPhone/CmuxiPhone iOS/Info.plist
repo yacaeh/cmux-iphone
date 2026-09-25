@@ -49,6 +49,8 @@
 	<string>Cmux iPhone needs to find your Mac running the bridge server on your local network.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Take a photo to send to the terminal session running on your Mac.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save images and videos from your Mac's terminal sessions to your photo library.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

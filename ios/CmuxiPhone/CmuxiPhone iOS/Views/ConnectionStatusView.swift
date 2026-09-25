@@ -3,6 +3,7 @@ import UIKit
 import PhotosUI
 import AVKit
 import WebKit
+import Photos
 
 // MARK: - Navigation routes
 //
@@ -1983,6 +1984,68 @@ private struct CmuxTerminalView: View {
     }
 }
 
+// MARK: - Save to Photos / share helpers
+
+private enum MediaSaveResult { case ok, denied, failed(String) }
+
+private enum MediaSaver {
+    static func ensureAddAuth() async -> Bool {
+        let s = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        if s == .authorized || s == .limited { return true }
+        guard s == .notDetermined else { return false }
+        let n = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        return n == .authorized || n == .limited
+    }
+
+    static func saveImageData(_ data: Data) async -> MediaSaveResult {
+        guard await ensureAddAuth() else { return .denied }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: data, options: nil)
+            }
+            return .ok
+        } catch { return .failed(error.localizedDescription) }
+    }
+
+    static func saveVideoFile(_ url: URL) async -> MediaSaveResult {
+        guard await ensureAddAuth() else { return .denied }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
+            }
+            return .ok
+        } catch { return .failed(error.localizedDescription) }
+    }
+
+    /// Stream a media URL to a temp file (named so share sheets/Photos keep the
+    /// right type). Returns nil on failure.
+    static func downloadToTemp(_ url: URL, filename: String) async -> URL? {
+        guard let (tmp, resp) = try? await URLSession.shared.download(from: url),
+              (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else { return nil }
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+        let out = dst.appendingPathComponent(filename)
+        do { try FileManager.default.moveItem(at: tmp, to: out); return out }
+        catch { return nil }
+    }
+}
+
+/// Standard iOS share sheet (save to Files, AirDrop, apps…).
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}
+
+private struct ShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 /// Identifies a tapped path to browse (file or directory).
 private struct BrowseTarget: Identifiable {
     let id = UUID()
@@ -2022,6 +2085,9 @@ private struct CmuxNodeScreen: View {
     @State private var errorMessage: String? = nil
     @State private var loading = true
     @State private var showSource = false
+    @State private var mediaBusy = false
+    @State private var mediaMsg: String? = nil
+    @State private var shareItem: ShareItem? = nil
 
     var body: some View {
         Group {
@@ -2043,10 +2109,14 @@ private struct CmuxNodeScreen: View {
                 switch node.kind {
                 case .directory: directoryList(node)
                 case .file: fileContent(node)
-                case .image: imageContent(node)
+                case .image:
+                    imageContent(node)
+                        .safeAreaInset(edge: .bottom) { mediaActionBar(node) }
                 // Audio streams through the same Range-backed media URL;
                 // AVPlayer plays it with the same transport controls.
-                case .video, .audio: videoContent(node)
+                case .video, .audio:
+                    videoContent(node)
+                        .safeAreaInset(edge: .bottom) { mediaActionBar(node) }
                 }
             }
         }
@@ -2188,6 +2258,88 @@ private struct CmuxNodeScreen: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding()
+        }
+    }
+
+    // 사진 저장 / 공유 bar for image·video·audio nodes.
+    @ViewBuilder
+    private func mediaActionBar(_ node: CmuxNode) -> some View {
+        HStack(spacing: 10) {
+            if node.kind != .audio { // Photos doesn't accept bare audio
+                Button { saveToPhotos(node) } label: {
+                    Label("사진에 저장", systemImage: "square.and.arrow.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .background(Color.claudeOrange, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+            }
+            Button { shareMedia(node) } label: {
+                Label("공유", systemImage: "square.and.arrow.up")
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .background(Color.surfaceElevated, in: Capsule())
+                    .foregroundStyle(Color.textPrimary)
+            }
+            if mediaBusy { ProgressView().controlSize(.small).tint(.white) }
+            Spacer()
+        }
+        .disabled(mediaBusy)
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+        .alert("저장/공유", isPresented: Binding(get: { mediaMsg != nil }, set: { if !$0 { mediaMsg = nil } })) {
+            Button("확인", role: .cancel) {}
+        } message: { Text(mediaMsg ?? "") }
+        .sheet(item: $shareItem) { s in ShareSheet(items: [s.url]) }
+    }
+
+    private func mediaData(_ node: CmuxNode) async -> Data? {
+        if let d = node.imageData { return d }
+        guard let url = relayService.mediaURL(terminalId, path: node.path),
+              let (d, _) = try? await URLSession.shared.data(from: url) else { return nil }
+        return d
+    }
+
+    private func saveToPhotos(_ node: CmuxNode) {
+        mediaBusy = true
+        Task {
+            defer { mediaBusy = false }
+            let result: MediaSaveResult
+            if node.kind == .image {
+                guard let d = await mediaData(node) else { mediaMsg = "다운로드 실패"; return }
+                result = await MediaSaver.saveImageData(d)
+            } else {
+                guard let url = relayService.mediaURL(terminalId, path: node.path),
+                      let tmp = await MediaSaver.downloadToTemp(url, filename: node.name) else {
+                    mediaMsg = "다운로드 실패"; return
+                }
+                result = await MediaSaver.saveVideoFile(tmp)
+            }
+            switch result {
+            case .ok: mediaMsg = "사진 앱에 저장했습니다 ✅"
+            case .denied: mediaMsg = "사진 추가 권한이 필요합니다 (설정 → Cmux iPhone → 사진)"
+            case .failed(let e): mediaMsg = "저장 실패: \(e)"
+            }
+        }
+    }
+
+    private func shareMedia(_ node: CmuxNode) {
+        mediaBusy = true
+        Task {
+            defer { mediaBusy = false }
+            if let d = node.imageData {
+                // write inline image data to a named temp file for the share sheet
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let out = dir.appendingPathComponent(node.name)
+                guard (try? d.write(to: out)) != nil else { mediaMsg = "파일 준비 실패"; return }
+                shareItem = ShareItem(url: out)
+            } else if let url = relayService.mediaURL(terminalId, path: node.path),
+                      let tmp = await MediaSaver.downloadToTemp(url, filename: node.name) {
+                shareItem = ShareItem(url: tmp)
+            } else {
+                mediaMsg = "다운로드 실패"
+            }
         }
     }
 
