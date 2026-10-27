@@ -2934,17 +2934,29 @@ async function startServer() {
   for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
     if (p !== envPort && p !== HOOK_PORT) candidatePorts.push(p); // never steal the hook port
   }
-  for (const port of candidatePorts) {
-    try {
-      boundPort = await tryListen(server, port);
-      break;
-    } catch (err) {
-      if (err.code === "EADDRINUSE") {
-        log("warn", `Port ${port} in use, trying next...`);
-        continue;
+  // EADDRNOTAVAIL: BIND_ADDRESS (e.g. the Tailscale IP) isn't assigned yet —
+  // typical right after login before Tailscale brings the interface up. Dying
+  // here leaves the phone unreachable until someone restarts the bridge, so
+  // wait for the address instead of exiting.
+  scan: for (;;) {
+    for (const port of candidatePorts) {
+      try {
+        boundPort = await tryListen(server, port);
+        break scan;
+      } catch (err) {
+        if (err.code === "EADDRINUSE") {
+          log("warn", `Port ${port} in use, trying next...`);
+          continue;
+        }
+        if (err.code === "EADDRNOTAVAIL") {
+          log("warn", `${BIND_ADDRESS} not available yet (Tailscale down?) — retrying in 10s...`);
+          await new Promise((r) => setTimeout(r, 10000));
+          continue scan;
+        }
+        throw err;
       }
-      throw err;
     }
+    break;
   }
 
   if (boundPort === null) {
